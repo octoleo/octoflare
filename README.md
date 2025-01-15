@@ -12,7 +12,7 @@ Linted by [#ShellCheck](https://github.com/koalaman/shellcheck)
 ## Install
 
 ```shell
-$ sudo curl -L "https://git.vdm.dev/api/v1/repos/octoleo/octoflare/raw/main/octoflare" -o /usr/local/bin/octoflare
+$ sudo curl -L "https://raw.githubusercontent.com/octoleo/octoflare/refs/heads/master/src/octoflare" -o /usr/local/bin/octoflare
 $ sudo chmod +x /usr/local/bin/octoflare
 ````
 

@@ -3,7 +3,7 @@
 # Program name
 PROGRAM_NAME="Octoflare"
 PROGRAM_CODE="octoflare"
-PROGRAM_VERSION="1.0.0"
+PROGRAM_VERSION="1.0.1"
 PROGRAM_V="1.0"
 # PROGRAM_URL="https://git.vdm.dev/octoleo/${PROGRAM_CODE}"
 
@@ -87,11 +87,11 @@ cfEnableAttackMode() {
 # cfDisableAttackMode - Disables IUAM and restores to a normal security level
 #
 # Globals:
-#   CLOUDFLARE_RESTORE_LEVEL - Level to restore (defaults to "high")
+#   CLOUDFLARE_RESTORE_LEVEL - Level to restore (defaults to "under_attack")
 cfDisableAttackMode() {
   local zone_id restore_level
   zone_id=$(_cfGetZoneId) || return 1
-  restore_level="${CLOUDFLARE_RESTORE_LEVEL:-high}"
+  restore_level="${CLOUDFLARE_RESTORE_LEVEL:-under_attack}"
   _echo "[info] Disabling Cloudflare Under Attack Mode for ${CLOUDFLARE_DOMAIN}, restoring '${restore_level}'..."
   _cfSetSecurityLevel "$zone_id" "$restore_level"
 }
@@ -197,7 +197,7 @@ runUpdate() {
   if [ -f "/usr/local/bin/${PROGRAM_CODE}" ]; then
     sudo mv "/usr/local/bin/${PROGRAM_CODE}" "/usr/local/bin/${PROGRAM_CODE}.bak"
   fi
-  if sudo curl --fail -L "https://git.vdm.dev/api/v1/repos/octoleo/${PROGRAM_CODE}/raw/main/${PROGRAM_CODE}" -o "/usr/local/bin/${PROGRAM_CODE}" 2>/dev/null; then
+  if sudo curl --fail -L "https://raw.githubusercontent.com/octoleo/${PROGRAM_CODE}/refs/heads/master/src/${PROGRAM_CODE}" -o "/usr/local/bin/${PROGRAM_CODE}" 2>/dev/null; then
     _echo "[success] Update successful."
     sudo rm -f "/usr/local/bin/${PROGRAM_CODE}.bak"
   else
