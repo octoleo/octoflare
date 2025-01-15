@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+
+# Program name
+PROGRAM_NAME="Octoflare"
+PROGRAM_CODE="octoflare"
+PROGRAM_VERSION="1.0.0"
+PROGRAM_V="1.0"
+# PROGRAM_URL="https://git.vdm.dev/octoleo/${PROGRAM_CODE}"
+
+# Do some prep work
+command -v curl >/dev/null 2>&1 || {
+  echo >&2 "[error] We require curl for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+  exit 1
+}
+command -v jq >/dev/null 2>&1 || {
+  echo >&2 "[error] We require jq for $PROGRAM_NAME v${PROGRAM_V} to work, but it's not installed. Aborting."
+  exit 1
+}
+
+#####################################################################################################################VDM
+######################################## Main Controller
+
+# main ˘Ô≈ôﺣ - The main function that controls the flow of the script
+#
+# This is the main function of the script, which controls the flow of execution and performs the following tasks:
+#
+# 1. Loads environment file (.env) from user-specified or default location
+# 2. Validates that CLOUDFLARE_API_TOKEN is available (via .env or env)
+# 3. Ensures a domain was passed with --domain argument
+# 4. Executes the selected action (--enable-attack-mode, --disable-attack-mode, --status-attack-mode)
+# 5. Exits with the appropriate status code
+#
+# Global Variables:
+#   ENV_FILE_PATH: Path to the .env file used to load variables
+#   CLOUDFLARE_API_TOKEN: Cloudflare API Token (from .env or environment)
+#   CLOUDFLARE_DOMAIN: The domain passed via --domain
+#   ACTION: The action chosen by the user (enable, disable, status)
+#
+# Arguments:
+#   None (relies on global variables populated during option parsing)
+#
+# Returns:
+#   None (script exits with proper code)
+main() {
+  # Load env file (if set or defaults exist)
+  loadEnvFile
+
+  # Make sure we have the API token
+  if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+    showError "CLOUDFLARE_API_TOKEN must be set in the .env file or exported in the shell." 2
+  fi
+
+  # Make sure we have a domain
+  if [[ -z "${CLOUDFLARE_DOMAIN:-}" ]]; then
+    showError "No domain provided. Use --domain=example.com" 3
+  fi
+
+  # Run the selected action
+  case "$ACTION" in
+    enable) cfEnableAttackMode ;;
+    disable) cfDisableAttackMode ;;
+    status) cfShowStatus ;;
+    *)
+      show_help
+      ;;
+  esac
+}
+
+#####################################################################################################################VDM
+######################################## Methods: Cloudflare
+
+# cfEnableAttackMode - Enables "I'm Under Attack Mode" for a Cloudflare zone
+#
+# Globals:
+#   CLOUDFLARE_API_TOKEN - API Token with Zone.Zone Settings:Read and Zone.Zone Settings:Edit permissions
+#   CLOUDFLARE_DOMAIN    - The domain name of the zone
+#
+# Returns:
+#   0 on success, 1 on failure
+cfEnableAttackMode() {
+  local zone_id
+  zone_id=$(_cfGetZoneId) || return 1
+  _echo "[info] Enabling Cloudflare Under Attack Mode for ${CLOUDFLARE_DOMAIN}..."
+  _cfSetSecurityLevel "$zone_id" "under_attack"
+}
+
+# cfDisableAttackMode - Disables IUAM and restores to a normal security level
+#
+# Globals:
+#   CLOUDFLARE_RESTORE_LEVEL - Level to restore (defaults to "high")
+cfDisableAttackMode() {
+  local zone_id restore_level
+  zone_id=$(_cfGetZoneId) || return 1
+  restore_level="${CLOUDFLARE_RESTORE_LEVEL:-high}"
+  _echo "[info] Disabling Cloudflare Under Attack Mode for ${CLOUDFLARE_DOMAIN}, restoring '${restore_level}'..."
+  _cfSetSecurityLevel "$zone_id" "$restore_level"
+}
+
+# cfShowStatus - Displays current security level of the zone
+cfShowStatus() {
+  local zone_id resp level
+  zone_id=$(_cfGetZoneId) || return 1
+  resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/settings/security_level" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    -H "Content-Type: application/json")
+  level=$(echo "$resp" | jq -r '.result.value')
+  _echo "[info] Current security level for ${CLOUDFLARE_DOMAIN}: ${level}"
+}
+
+#####################################################################################################################VDM
+######################################## Methods: Cloudflare Helpers
+
+# _cfGetZoneId - Retrieves the Zone ID for CLOUDFLARE_DOMAIN
+#
+# Returns:
+#   The zone ID as a string, or exits with error if not found
+_cfGetZoneId() {
+  local zone_id
+  zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${CLOUDFLARE_DOMAIN}" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    -H "Content-Type: application/json" | jq -r '.result[0].id')
+  if [[ "$zone_id" == "null" || -z "$zone_id" ]]; then
+    showError "Could not find Zone ID for ${CLOUDFLARE_DOMAIN}" 4
+  fi
+  echo "$zone_id"
+}
+
+# _cfSetSecurityLevel - Updates the zone's security level
+#
+# Arguments:
+#   $1: Zone ID
+#   $2: Security level (under_attack, high, medium, low, essentially_off)
+_cfSetSecurityLevel() {
+  local zone_id="$1"
+  local level="$2"
+  local payload resp
+  payload=$(jq -n --arg v "$level" '{value:$v}')
+  resp=$(curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/${zone_id}/settings/security_level" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "$payload")
+  if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
+    _echo "[success] Security level set to '${level}' for ${CLOUDFLARE_DOMAIN}"
+  else
+    _echo "[error] Failed to set security level. Response:"
+    echo "$resp"
+    return 1
+  fi
+}
+
+#####################################################################################################################VDM
+######################################## Utility & Management
+
+# loadEnvFile - Loads environment variables from ENV_FILE_PATH or defaults
+#
+# Globals:
+#   ENV_FILE_PATH: Path passed via --env, or discovered default
+#
+# Returns:
+#   None
+loadEnvFile() {
+  local tmp_path="./.${PROGRAM_CODE}"
+  [ -f "$tmp_path" ] || tmp_path="/home/$USER/.config/${PROGRAM_CODE}/.env"
+  : "${ENV_FILE_PATH:=$tmp_path}"
+  if [ -f "${ENV_FILE_PATH}" ]; then
+    # shellcheck disable=SC1090
+    source "${ENV_FILE_PATH}"
+    _echo "[info] Loaded environment file: ${ENV_FILE_PATH}"
+  fi
+}
+
+# _echo - outputs a message to the console if QUIET is false
+_echo() {
+  if ! $QUIET; then
+    echo "$1"
+  fi
+}
+
+# showError - Show error message and exit with specified code
+showError() {
+  _echo "[error] $1"
+  exit "$2"
+}
+
+# runUninstall - Uninstall the script
+runUninstall() {
+  if [ -f "/usr/local/bin/${PROGRAM_CODE}" ]; then
+    sudo rm -f "/usr/local/bin/${PROGRAM_CODE}"
+    _echo "[info] ${PROGRAM_NAME} v${PROGRAM_VERSION} uninstalled."
+  else
+    _echo "[info] ${PROGRAM_NAME} is not installed."
+  fi
+}
+
+# runUpdate - Self-update the script from repository
+runUpdate() {
+  if [ -f "/usr/local/bin/${PROGRAM_CODE}" ]; then
+    sudo mv "/usr/local/bin/${PROGRAM_CODE}" "/usr/local/bin/${PROGRAM_CODE}.bak"
+  fi
+  if sudo curl --fail -L "https://git.vdm.dev/api/v1/repos/octoleo/${PROGRAM_CODE}/raw/main/${PROGRAM_CODE}" -o "/usr/local/bin/${PROGRAM_CODE}" 2>/dev/null; then
+    _echo "[success] Update successful."
+    sudo rm -f "/usr/local/bin/${PROGRAM_CODE}.bak"
+  else
+    _echo "[error] Update failed, restoring backup."
+    [ -f "/usr/local/bin/${PROGRAM_CODE}.bak" ] && sudo mv "/usr/local/bin/${PROGRAM_CODE}.bak" "/usr/local/bin/${PROGRAM_CODE}"
+  fi
+  [ -f "/usr/local/bin/${PROGRAM_CODE}" ] && sudo chmod +x "/usr/local/bin/${PROGRAM_CODE}"
+  exit 0
+}
+
+# show_help - Display help message ʕ•ᴥ•ʔ
+show_help() {
+  cat <<EOF
+Usage: ${PROGRAM_CODE} [OPTION...] --domain=example.com
+
+	Options
+	======================================================
+	--enable-attack-mode       Enable "Under Attack Mode"
+	--disable-attack-mode      Disable "Under Attack Mode"
+	--status-attack-mode       Show current security level
+	--domain=<domain>          Specify the domain to manage
+	-e | --env=<file>          Path to custom .env file
+	--update                   Update this script to latest version
+	--uninstall                Uninstall this script
+	--quiet                    Suppress all output
+	--debug                    Show loaded environment variables
+	-h | --help                Show this help message
+	======================================================
+	Environment Variables
+	======================================================
+	CLOUDFLARE_API_TOKEN       Cloudflare API Token (Zone:Read + Zone:Edit)
+	CLOUDFLARE_RESTORE_LEVEL   Level to restore when disabling IUAM (default: high)
+	======================================================
+			${PROGRAM_NAME} v${PROGRAM_VERSION}
+	======================================================
+EOF
+}
+
+#####################################################################################################################VDM
+######################################## Defaults & Option Parsing
+
+QUIET=false
+ACTION=""
+
+# parse options
+while :; do
+  case $1 in
+    --enable-attack-mode) ACTION="enable" ;;
+    --disable-attack-mode) ACTION="disable" ;;
+    --status-attack-mode) ACTION="status" ;;
+    --domain=?*) CLOUDFLARE_DOMAIN=${1#*=} ;;
+    -e | --env)
+      if [ "$2" ]; then
+        ENV_FILE_PATH=$2
+        shift
+      else
+        _echo '[error] "--env" requires a non-empty option argument.'
+        exit 17
+      fi
+      ;;
+    -e=?* | --env=?*) ENV_FILE_PATH=${1#*=} ;;
+    --update) runUpdate ;;
+    --uninstall) runUninstall; exit 0 ;;
+    --quiet) QUIET=true ;;
+    --debug)
+      echo "[debug] CLOUDFLARE_DOMAIN=${CLOUDFLARE_DOMAIN:-unset}"
+      echo "[debug] CLOUDFLARE_RESTORE_LEVEL=${CLOUDFLARE_RESTORE_LEVEL:-high}"
+      echo "[debug] ENV_FILE_PATH=${ENV_FILE_PATH:-auto-detect}"
+      exit 0
+      ;;
+    -h|--help) show_help; exit 0 ;;
+    *) break ;;
+  esac
+  shift
+done
+
+#####################################################################################################################VDM
+######################################## Run Main
+main
+
