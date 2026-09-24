@@ -9,7 +9,7 @@
 
 registerCommand workers list "[--account-id=<id>]" "List Worker scripts"
 registerCommand workers upload "--name=<script> --file=<worker.js> [--module=true|false] [--compatibility-date=<date>] [--compatibility-flags=a,b] [--kv=BINDING=<namespace-id>] [--vars=<json>] [--bindings=<json>]" "Upload (create or update) a Worker script"
-registerCommand workers download "--name=<script> [--file=<path>]" "Download a Worker script"
+registerCommand workers download "--name=<script> [--file=<path>] [--raw]" "Download a Worker script (first module of an ES module Worker; --raw keeps the multipart body)"
 registerCommand workers delete "--name=<script> [--force]" "Delete a Worker script"
 registerCommand workers secret-list "--name=<script>" "List the secrets of a Worker"
 registerCommand workers secret-set "--name=<script> --secret-name=<NAME> (--secret-value=<v> | --from-env=<VAR>)" "Set a secret on a Worker"
@@ -78,15 +78,34 @@ cmd_workers_upload() {
     bindings="$(jq -cn --argjson b "$bindings" --argjson v "$(readFileOrValue "$(opt vars)")" '$b + ($v | to_entries | map({type:"plain_text", name:.key, text:(.value|tostring)}))')"
   fi
   date="$(opt compatibility-date "$(date -u +%Y-%m-%d)")"
-  metadata="$(jq -cn --arg d "$date" --argjson flags "$(toJsonArray "$(opt compatibility-flags)")" --argjson b "$bindings" --argjson m "$module" \
-    '{compatibility_date:$d, compatibility_flags:$flags, bindings:$b} + (if $m then {main_module:"worker.js"} else {body_part:"script"} end)')"
+  # Bindings not given on this command line are kept on the Worker (secrets always, vars/KV
+  # unless they were supplied), so a re-upload never silently drops secrets set earlier.
+  local keep='["secret_text","secret_key"]'
+  hasOpt vars || hasOpt bindings || keep="$(jq -cn --argjson k "$keep" '$k + ["plain_text","json"]')"
+  hasOpt kv || hasOpt bindings || keep="$(jq -cn --argjson k "$keep" '$k + ["kv_namespace"]')"
+  metadata="$(jq -cn --arg d "$date" --argjson flags "$(toJsonArray "$(opt compatibility-flags)")" --argjson b "$bindings" --argjson m "$module" --argjson keep "$keep" \
+    '{compatibility_date:$d, compatibility_flags:$flags, bindings:$b, keep_bindings:$keep} + (if $m then {main_module:"worker.js"} else {body_part:"script"} end)')"
+  # the metadata goes through a file: an inline -F value stops at the first ';'
+  local meta_file="${OCTOFLARE_TMPDIR}/worker.metadata.$$.json"
+  printf '%s' "$metadata" >"$meta_file" || die "Could not write ${meta_file}" "$EX_SOFTWARE"
   logInfo "Uploading Worker ${name} from ${file} ($( [[ "$module" == "true" ]] && echo "ES module" || echo "service worker" ))..."
   if [[ "$module" == "true" ]]; then
-    cfApi PUT "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}" "" multipart -F "metadata=${metadata};type=application/json" -F "worker.js=@${file};type=application/javascript+module"
+    cfApi PUT "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}" "" multipart -F "metadata=<${meta_file};type=application/json" -F "worker.js=@${file};type=application/javascript+module"
   else
-    cfApi PUT "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}" "" multipart -F "metadata=${metadata};type=application/json" -F "script=@${file};type=application/javascript"
+    cfApi PUT "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}" "" multipart -F "metadata=<${meta_file};type=application/json" -F "script=@${file};type=application/javascript"
   fi
+  rm -f "$meta_file"
   emitResult "$(cfResult '.result // {} | {id:(.id // "'"$name"'"), etag, modified_on, compatibility_date, handlers}')" '"id=\(.id)\nmodified_on=\(.modified_on // "-")\ncompatibility_date=\(.compatibility_date // "-")"'
+}
+
+# multipartFirstPart - Body of the first part of a multipart/form-data document (headers stripped)
+multipartFirstPart() {
+  printf '%s\n' "$1" | awk '
+    NR == 1 { boundary = $0; sub(/\r$/, "", boundary); inpart = 1; inbody = 0; next }
+    { line = $0; sub(/\r$/, "", line) }
+    line == boundary || line == boundary "--" { if (inbody) exit; inpart = 1; inbody = 0; next }
+    inpart && !inbody && line == "" { inbody = 1; next }
+    inbody { print line }'
 }
 
 cmd_workers_download() {
@@ -95,6 +114,15 @@ cmd_workers_download() {
   name="$(workerName)" || exit $?
   file="$(opt file)"
   cfApi GET "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}" "" none
+  # ES module Workers come back as multipart/form-data with one part per module
+  if [[ "$CF_RESPONSE" == --* && "$CF_RESPONSE" == *"Content-Disposition:"* ]]; then
+    local parts
+    parts="$(printf '%s\n' "$CF_RESPONSE" | grep -c 'Content-Disposition:' || true)"
+    [[ "$parts" -gt 1 ]] && logWarn "Worker ${name} has ${parts} modules; only the first one is returned (use the multipart response with --raw for all)."
+    if [[ "$(optBool raw)" != "true" ]]; then
+      CF_RESPONSE="$(multipartFirstPart "$CF_RESPONSE")"
+    fi
+  fi
   if [[ -n "$file" ]]; then
     printf '%s\n' "$CF_RESPONSE" >"$file"
     emitMessage "Worker ${name} written to ${file}." "$(jq -cn --arg f "$file" '{file:$f}')"
@@ -172,7 +200,8 @@ cmd_workers_subdomain() {
   value="$(opt value)"
   [[ -z "$value" && -n "${ARGS[2]:-}" ]] && value="${ARGS[2]}"
   if [[ -n "$value" ]]; then
-    cfApi POST "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}/subdomain" "$(jq -cn --argjson e "$(normalizeBool "$value")" '{enabled:$e, previews_enabled:$e}')"
+    value="$(parseBool "$value")" || exit $?
+    cfApi POST "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}/subdomain" "$(jq -cn --argjson e "$value" '{enabled:$e, previews_enabled:$e}')"
   else
     cfApi GET "/accounts/${CF_ACCOUNT_ID}/workers/scripts/${name}/subdomain"
   fi
@@ -260,8 +289,13 @@ kvNamespaceId() {
     printf '%s' "$ns"
     return 0
   fi
+  # the namespace listing must not be cut short by a --limit meant for the actual command
+  local saved_limit=""
+  hasOpt limit && saved_limit="$(opt limit)"
+  unset OPT_limit
   cfApiList "/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces"
-  id="$(printf '%s' "$CF_RESPONSE" | jq -r --arg t "$ns" '[.result[] | select(.title == $t)][0].id // empty')"
+  [[ -n "$saved_limit" ]] && setOpt limit "$saved_limit"
+  id="$(printf '%s' "$CF_RESPONSE" | jq -r --arg t "$ns" '[.result[]? | select(.title == $t)][0].id // empty')"
   if [[ -z "$id" ]]; then
     [[ "$OCTOFLARE_DRY_RUN" == "true" ]] && { printf 'dry-run-namespace-id'; return 0; }
     die "KV namespace not found: ${ns}" "$EX_NOTFOUND"
@@ -317,19 +351,29 @@ cmd_kv_get() {
 cmd_kv_put() {
   resolveAccount
   requireOpt key
-  local id value path query
+  local id src path query meta_file
   id="$(kvNamespaceId)" || exit $?
+  # The value is always uploaded from a file so that binary data, NUL bytes and trailing
+  # newlines survive and so that ';' or a leading '<' in a value cannot confuse curl.
   if hasOpt file; then
-    value="$(cat "$(opt file)")"
+    src="$(opt file)"
+    [[ -f "$src" ]] || die "File not found: ${src}" "$EX_ARGS"
   else
-    value="$(readFileOrValue "$(opt value)")"
+    hasOpt value || die "Provide --value=<v>, --value=@<file>, --value=- (stdin) or --file=<path>" "$EX_ARGS"
+    case "$(opt value)" in
+      @*) src="$(opt value)"; src="${src#@}"; [[ -f "$src" ]] || die "File not found: ${src}" "$EX_ARGS" ;;
+      -) src="${OCTOFLARE_TMPDIR}/kv.value.$$"; cat >"$src" ;;
+      *) src="${OCTOFLARE_TMPDIR}/kv.value.$$"; printf '%s' "$(opt value)" >"$src" ;;
+    esac
   fi
   query="$(cfQuery "expiration_ttl=$(opt ttl)" "expiration=$(opt expiration)")"
   path="$(cfPath "/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${id}/values/$(urlEncode "$(opt key)")" "$query")"
   if hasOpt metadata; then
-    cfApi PUT "$path" "" multipart -F "value=${value}" -F "metadata=$(readFileOrValue "$(opt metadata)")"
+    meta_file="${OCTOFLARE_TMPDIR}/kv.metadata.$$.json"
+    readFileOrValue "$(opt metadata)" | jq -c . >"$meta_file" || die "--metadata must be valid JSON" "$EX_ARGS"
+    cfApi PUT "$path" "" multipart -F "value=<${src}" -F "metadata=<${meta_file};type=application/json"
   else
-    cfApi PUT "$path" "$value" "text/plain"
+    cfApi PUT "$path" "" none -H "Content-Type: application/octet-stream" --data-binary "@${src}"
   fi
   emitMessage "Key $(opt key) written." "$(jq -cn --arg k "$(opt key)" '{key:$k}')"
 }

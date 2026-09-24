@@ -73,7 +73,20 @@ jobs:
           echo "result=$RESULT"
           test "$EXIT_CODE" = "0"
           test "$ZONE_ID" = "dry-run-zone-id"
-          echo "$RESULT" | jq -e '.name == "www.example.com" and .comment == "set by CI" and .proxied == true'
+          printf '%s' "$RESULT" | jq -e '.name == "www.example.com" and .comment == "set by CI" and .proxied == true'
+      - name: Command input is never evaluated by a shell
+        id: literal
+        uses: ./
+        with:
+          api-token: dummy-token
+          domain: example.com
+          dry-run: true
+          command: |
+            dns upsert --name=spf --type=TXT --content="v=spf1 $(id) `whoami` ~all"
+      - name: Check literal handling
+        env:
+          RESULT: ${{ steps.literal.outputs.result }}
+        run: printf '%s' "$RESULT" | jq -e '.content == "\"v=spf1 $(id) `whoami` ~all\""'
       - name: Batch commands
         id: batch
         uses: ./
@@ -93,7 +106,7 @@ jobs:
           FAILED: ${{ steps.batch.outputs.failed }}
         run: |
           test "$FAILED" = "0"
-          echo "$RESULT" | jq -e '.total == 4 and .failed == 0'
+          printf '%s' "$RESULT" | jq -e '.total == 4 and .failed == 0'
       - name: Field extraction
         id: field
         uses: ./

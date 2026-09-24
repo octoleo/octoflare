@@ -15,7 +15,7 @@ registerCommand tunnel delete "(--name=<tunnel> | --id=<tunnel-id>) [--force]" "
 registerCommand tunnel token "(--name=<tunnel> | --id=<tunnel-id>)" "Print the connector token (cloudflared tunnel run --token ...)"
 registerCommand tunnel config "(--name=<tunnel> | --id=<tunnel-id>)" "Show the remote ingress configuration"
 registerCommand tunnel config-set "(--name=<tunnel> | --id=<tunnel-id>) (--ingress=host=service,... | --file=<config.json>)" "Replace the remote ingress configuration"
-registerCommand tunnel route "(--name=<tunnel> | --id=<tunnel-id>) --hostname=<host> [--service=<url>]" "Publish a hostname: DNS CNAME to the tunnel (+ ingress entry when --service is given)"
+registerCommand tunnel route "(--name=<tunnel> | --id=<tunnel-id>) --hostname=<host> [--service=<url>] [--path=<prefix>]" "Publish a hostname: DNS CNAME to the tunnel (+ ingress entry when --service is given, other entries kept)"
 registerCommand tunnel connections "(--name=<tunnel> | --id=<tunnel-id>)" "List active connections"
 registerCommand tunnel cleanup "(--name=<tunnel> | --id=<tunnel-id>)" "Clean up stale connections"
 
@@ -65,12 +65,13 @@ cmd_tunnel_create() {
   name="$(optFirst "" name tunnel)"
   [[ -z "$name" ]] && die "Missing --name=<tunnel>" "$EX_ARGS"
   secret="$(opt secret)"
+  ghMask "$secret"
   body="$(jq -cn --arg n "$name" --arg s "$secret" '{name:$n, config_src:"cloudflare"} + (if $s != "" then {tunnel_secret:$s} else {} end)')"
   logInfo "Creating tunnel ${name}..."
   cfApi POST "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" "$body"
   CF_TUNNEL_ID="$(cfResultRaw '.result.id // empty')"
   local tunnel token=""
-  tunnel="$(cfResult)"
+  tunnel="$(cfResult '.result | if type=="object" then del(.tunnel_secret) else . end')"
   if [[ -n "$CF_TUNNEL_ID" && "$OCTOFLARE_DRY_RUN" != "true" ]]; then
     cfApi GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/token"
     token="$(cfResultRaw '.result // empty')"
@@ -137,11 +138,16 @@ cmd_tunnel_route() {
   service="$(opt service)"
   if [[ -n "$service" ]]; then
     cfApi GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/configurations"
-    existing="$(cfResult '.result.config.ingress // []')"
-    ingress="$(jq -cn --argjson i "$existing" --arg h "$host" --arg s "$service" '
-      $i | (map(select(.hostname != $h and .hostname != null)) + [{hostname:$h, service:$s}]) + [{service:"http_status:404"}]')"
-    cfApi PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/configurations" "$(jq -cn --argjson i "$ingress" '{config:{ingress:$i}}')"
-    logInfo "Ingress ${host} -> ${service} saved."
+    # keep the whole existing config (originRequest, warp-routing, other hostnames and paths);
+    # only the entry with the same hostname AND path is replaced, the catch-all stays last
+    existing="$(cfResult '.result.config // {}')"
+    ingress="$(jq -cn --argjson c "$existing" --arg h "$host" --arg s "$service" --arg p "$(opt path)" '
+      $c | .ingress = (
+        ((.ingress // []) | map(select(.hostname != null)) | map(select((.hostname != $h) or ((.path // "") != $p))))
+        + [({hostname:$h, service:$s} + (if $p != "" then {path:$p} else {} end))]
+        + [{service:"http_status:404"}])')"
+    cfApi PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/configurations" "$(jq -cn --argjson c "$ingress" '{config:$c}')"
+    logInfo "Ingress ${host}${OPT_path:+$(opt path)} -> ${service} saved."
   fi
   CF_ZONE_ID=""
   setOpt name "$host"

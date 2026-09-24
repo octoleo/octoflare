@@ -16,7 +16,9 @@ jobs:
       - name: Build single-file bundle
         run: |
           scripts/bundle.sh dist/octoflare
-          cp install.sh dist/install.sh
+          # the released installer installs this tag by default, not master
+          sed "s|^REF=\"\${OCTOFLARE_REF:-master}\"|REF=\"\${OCTOFLARE_REF:-${GITHUB_REF_NAME}}\"|" install.sh > dist/install.sh
+          grep -q "OCTOFLARE_REF:-${GITHUB_REF_NAME}" dist/install.sh
           (cd dist && sha256sum octoflare install.sh > SHA256SUMS)
       - name: Smoke test
         env:

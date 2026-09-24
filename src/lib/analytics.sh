@@ -22,10 +22,22 @@ graphql() {
   fi
 }
 
-# dateDaysAgo - YYYY-MM-DD for N days ago (GNU and BSD date)
+# dateDaysAgo - YYYY-MM-DD for N days ago (GNU date, BSD date, then jq for BusyBox and friends)
 dateDaysAgo() {
-  local n="$1"
-  date -u -d "-${n} days" +%Y-%m-%d 2>/dev/null || date -u -v "-${n}d" +%Y-%m-%d
+  local n="$1" d
+  d="$(date -u -d "-${n} days" +%Y-%m-%d 2>/dev/null)" \
+    || d="$(date -u -v "-${n}d" +%Y-%m-%d 2>/dev/null)" \
+    || d="$(jq -rn --argjson n "$n" '(now - $n * 86400) | strftime("%Y-%m-%d")')"
+  printf '%s' "$d"
+}
+
+# dateTimeDaysAgo - ISO 8601 UTC timestamp for N days ago (same fallbacks)
+dateTimeDaysAgo() {
+  local n="$1" d
+  d="$(date -u -d "-${n} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+    || d="$(date -u -v "-${n}d" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+    || d="$(jq -rn --argjson n "$n" '(now - $n * 86400) | strftime("%Y-%m-%dT%H:%M:%SZ")')"
+  printf '%s' "$d"
 }
 
 cmd_analytics_zone() {
@@ -57,7 +69,7 @@ cmd_analytics_firewall() {
   resolveZone
   local days since query result
   days="$(opt days 1)"
-  since="$(date -u -d "-${days} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v "-${days}d" +%Y-%m-%dT%H:%M:%SZ)"
+  since="$(dateTimeDaysAgo "$days")"
   # shellcheck disable=SC2016
   query='query ($zoneTag: String!, $since: Time!) {
     viewer { zones(filter: {zoneTag: $zoneTag}) {

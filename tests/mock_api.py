@@ -46,6 +46,9 @@ def fresh_state():
         "access_rules": {"zone123": [], "zone456": []},
         "pagerules": {"zone123": [], "zone456": []},
         "tiered_cache": {"zone123": "off", "zone456": "off"},
+        "lists": [],
+        "list_items": {},
+        "r2_buckets": [{"name": "assets-%02d" % i, "creation_date": "2025-01-01T00:00:00Z", "location": "WEUR", "storage_class": "Standard"} for i in range(1, 8)],
         "flaky_hits": 0,
         "ratelimit_hits": 0,
         "counter": 0,
@@ -217,6 +220,50 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, envelope(items, info))
         if api == "/accounts/acc123" and method == "GET":
             return self.send_json(200, envelope({"id": "acc123", "name": "Test Account", "type": "standard"}))
+        # -------------------------------------------------------------- account lists
+        if api == "/accounts/acc123/rules/lists":
+            if method == "GET":
+                return self.send_json(200, envelope([dict(l, num_items=len(STATE["list_items"].get(l["id"], []))) for l in STATE["lists"]]))
+            if method == "POST":
+                lst = {"id": next_id("list"), "name": body["name"], "kind": body["kind"], "description": body.get("description", "")}
+                STATE["lists"].append(lst)
+                STATE["list_items"][lst["id"]] = []
+                return self.send_json(200, envelope(lst))
+        lm = re.match(r"^/accounts/acc123/rules/lists/([^/]+)(/items)?$", api)
+        if lm:
+            lst = next((l for l in STATE["lists"] if l["id"] == lm.group(1)), None)
+            if lst is None:
+                return self.not_found("list not found")
+            items = STATE["list_items"][lst["id"]]
+            if lm.group(2) is None:
+                if method == "GET":
+                    return self.send_json(200, envelope(dict(lst, num_items=len(items))))
+                if method == "DELETE":
+                    STATE["lists"].remove(lst)
+                    return self.send_json(200, envelope({"id": lst["id"]}))
+            else:
+                if method == "GET":
+                    return self.send_json(200, envelope(items, {"cursors": {}}))
+                if method == "POST":
+                    for it in body:
+                        items.append(dict(it, id=next_id("item")))
+                    return self.send_json(200, envelope({"operation_id": next_id("op")}))
+                if method == "PUT":
+                    items[:] = [dict(it, id=next_id("item")) for it in body]
+                    return self.send_json(200, envelope({"operation_id": next_id("op")}))
+                if method == "DELETE":
+                    gone = {d["id"] for d in body.get("items", [])}
+                    items[:] = [it for it in items if it["id"] not in gone]
+                    return self.send_json(200, envelope({"operation_id": next_id("op")}))
+        # -------------------------------------------------------------- r2 buckets (object result + cursor)
+        if api == "/accounts/acc123/r2/buckets" and method == "GET":
+            buckets = STATE["r2_buckets"]
+            if "name_contains" in query:
+                buckets = [b for b in buckets if query["name_contains"][0] in b["name"]]
+            start = int(query.get("cursor", ["0"])[0] or 0)
+            chunk = buckets[start:start + 3]
+            info = {"cursor": str(start + 3)} if start + 3 < len(buckets) else {}
+            return self.send_json(200, envelope({"buckets": chunk}, info))
         if api == "/user/tokens/verify":
             return self.send_json(200, envelope({"id": "tok123", "status": "active"}))
         if api == "/user":

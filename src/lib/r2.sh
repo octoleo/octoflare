@@ -28,8 +28,17 @@ r2Bucket() {
 
 cmd_r2_list() {
   resolveAccount
-  cfApiCursor "/accounts/${CF_ACCOUNT_ID}/r2/buckets" "$(cfQuery "name_contains=$(opt name-contains)")"
-  emitResult "$(cfResult '.result | if type=="object" then (.buckets // []) else (map(.buckets // .) | flatten) end')" "$R2_TEMPLATE" "No R2 buckets."
+  # the R2 listing returns {buckets:[...]} with a result_info.cursor, not a plain array
+  local cursor="" all='[]' page query
+  while :; do
+    query="$(cfQuery "name_contains=$(opt name-contains)" "cursor=${cursor}")"
+    cfApi GET "$(cfPath "/accounts/${CF_ACCOUNT_ID}/r2/buckets" "$query")"
+    page="$(cfResult '.result | if type=="object" then (.buckets // []) else (. // []) end')"
+    all="$(printf '%s\n%s' "$all" "$page" | jq -cs '.[0] + .[1]')"
+    cursor="$(cfResultRaw '.result_info.cursor // empty')"
+    [[ -z "$cursor" || -n "$(opt limit)" ]] && break
+  done
+  emitResult "$all" "$R2_TEMPLATE" "No R2 buckets."
 }
 
 cmd_r2_get() {
@@ -119,7 +128,8 @@ cmd_r2_public() {
   value="$(opt value)"
   [[ -z "$value" && -n "${ARGS[2]:-}" ]] && value="${ARGS[2]}"
   if [[ -n "$value" ]]; then
-    cfApi PUT "$path" "$(jq -cn --argjson e "$(normalizeBool "$value")" '{enabled:$e}')"
+    value="$(parseBool "$value")" || exit $?
+    cfApi PUT "$path" "$(jq -cn --argjson e "$value" '{enabled:$e}')"
   else
     cfApi GET "$path"
   fi

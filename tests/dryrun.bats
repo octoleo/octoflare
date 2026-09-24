@@ -42,10 +42,10 @@ request() {
   [[ "$(request 2)" == "POST ${CLOUDFLARE_API_BASE}/zones/dry-run-zone-id/workers/routes {\"pattern\":\"example.com/api/*\",\"script\":\"my-worker\"}" ]]
 }
 
-@test "kv put writes the raw value with a ttl" {
+@test "kv put targets the key with a ttl (the value travels in a file, see review_workers.bats)" {
   octo kv put --namespace=0123456789abcdef0123456789abcdef --key='my key' --value=hello --ttl=60 --json
   [ "$status" -eq 0 ]
-  [[ "$(request 1)" == "PUT ${CLOUDFLARE_API_BASE}/accounts/acc123/storage/kv/namespaces/0123456789abcdef0123456789abcdef/values/my%20key?expiration_ttl=60 hello" ]]
+  [[ "$(request 1)" == "PUT ${CLOUDFLARE_API_BASE}/accounts/acc123/storage/kv/namespaces/0123456789abcdef0123456789abcdef/values/my%20key?expiration_ttl=60" ]]
 }
 
 @test "kv bulk-put reads --file" {

@@ -178,7 +178,12 @@ cmd_list_remove() {
   requireOpt items
   local ids
   cfApiCursor "/accounts/${CF_ACCOUNT_ID}/rules/lists/${CF_LIST_ID}/items"
-  ids="$(printf '%s' "$CF_RESPONSE" | jq -c --argjson v "$(toJsonArray "$(opt items)")" '[.result[] | select((.ip // (.asn|tostring) // .hostname.url_hostname // .redirect.source_url) as $x | $v | index($x)) | {id}]')"
+  # match on the value that the list kind stores (ip, asn number, hostname or redirect source)
+  local wanted
+  wanted="$(toJsonArray "$(opt items)" | jq -c 'map(ltrimstr("AS") | ltrimstr("as"))')"
+  ids="$(printf '%s' "$CF_RESPONSE" | jq -c --argjson v "$wanted" '[.result[]? |
+      ((.ip // .hostname.url_hostname // .redirect.source_url // (if .asn != null then (.asn|tostring) else null end)) as $x |
+       select($x != null and ($v | index($x) != null))) | {id}]')"
   [[ "$(printf '%s' "$ids" | jq 'length')" == "0" && "$OCTOFLARE_DRY_RUN" != "true" ]] && die "None of the items were found in the list" "$EX_NOTFOUND"
   cfApi DELETE "/accounts/${CF_ACCOUNT_ID}/rules/lists/${CF_LIST_ID}/items" "$(jq -cn --argjson i "$ids" '{items:$i}')"
   emitResult "$(cfResult)" '"operation_id=\(.operation_id // "-")"'
@@ -249,7 +254,7 @@ cmd_bulk_redirect_remove() {
 bulkRedirectRule() {
   local enabled="$1" name rule
   bulkRedirectList
-  name="$(opt list)"
+  name="$(optFirst "" list name)"
   setOpt scope account
   rule="$(jq -cn --arg n "$name" --argjson en "$enabled" '{expression:("http.request.full_uri in $" + $n), action:"redirect", action_parameters:{from_list:{name:$n, key:"http.request.full_uri"}}, description:("Bulk redirects: " + $n), enabled:$en}')"
   setOpt description "Bulk redirects: ${name}"

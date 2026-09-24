@@ -20,7 +20,7 @@ MODULES="$(sed -n 's/^OCTOFLARE_MODULES="\${OCTOFLARE_MODULES:-\(.*\)}"$/\1/p' "
 mkdir -p "$(dirname "$OUT")"
 {
   # everything before the bootstrap section (identity, helpers)
-  awk -v marker="$MARKER" 'index($0, marker) == 1 {exit} {print}' "$MAIN"
+  awk -v marker="$MARKER" '$0 == marker {exit} {print}' "$MAIN"
   printf '\n#####################################################################################################################VDM\n'
   printf '######################################## Bundled modules\n\nOCTOFLARE_BUNDLED=true\n'
   for m in $MODULES; do
@@ -29,7 +29,7 @@ mkdir -p "$(dirname "$OUT")"
   done
   printf '\n#####################################################################################################################VDM\n'
   # the bootstrap section and everything after it
-  awk -v marker="$MARKER" 'found {print; next} index($0, marker) == 1 {found=1; print}' "$MAIN"
+  awk -v marker="$MARKER" 'found {print; next} $0 == marker {found=1; print}' "$MAIN"
 } >"$OUT"
 chmod +x "$OUT"
 echo "Bundled $(wc -l <"$OUT" | tr -d ' ') lines into ${OUT}"

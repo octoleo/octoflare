@@ -36,6 +36,9 @@ jobs:
             --content=${{ inputs.content }} --proxied=${{ inputs.proxied }}
             --comment="set by ${{ github.workflow }} run ${{ github.run_id }}"
       - name: Show result
+        env:
+          RECORD_ID: ${{ steps.dns.outputs.id }}
+          RESULT: ${{ steps.dns.outputs.result }}
         run: |
-          echo "record id: ${{ steps.dns.outputs.id }}"
-          echo '${{ steps.dns.outputs.result }}' | jq .
+          echo "record id: $RECORD_ID"
+          printf '%s' "$RESULT" | jq .

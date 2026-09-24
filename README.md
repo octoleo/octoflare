@@ -26,7 +26,8 @@ Linted by [#ShellCheck](https://github.com/koalaman/shellcheck), tested with
   re-run safely; results report `created`, `updated` or `unchanged`.
 * **Workflow ready**: a composite GitHub Action (`uses: octoleo/octoflare@master`), JSON output,
   `--field=<jq>` extraction, step outputs (`result`, `id`, `zone-id`, ...), `::error::`
-  annotations, secret masking and a batch runner for multi-step changes.
+  annotations, secret masking and a batch runner for multi-step changes. Command lines given to
+  the action or to batch files are tokenised by Octoflare and never evaluated by a shell.
 * **Unattended by design**: in CI (or with `--unattended`) it never prompts and installs whatever
   it is missing - `curl`, `jq`, and its own modules - instead of failing.
 * **Zone auto-detection**: `dns upsert --name=app.example.com ...` finds the zone from the record
@@ -63,7 +64,8 @@ A **single-file bundle** (all modules inlined) is attached to every
 `scripts/bundle.sh`.
 
 Requirements: Bash 3.2+, `curl`, `jq` (both auto-installed in unattended mode; `openssl` only for
-`ssl origin-cert-create`; `wrangler`/Node only for `pages deploy --dir`).
+`ssl origin-cert-create`; `wrangler` 4 or Node/npx only for `pages deploy --dir`, where
+unattended runs need `--install-wrangler` before Octoflare fetches it through npx).
 
 Update and remove:
 
@@ -492,7 +494,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 |---|---|
 | `workers list [--account-id=<id>]` | List Worker scripts |
 | `workers upload --name=<script> --file=<worker.js> [--module=true\|false] [--compatibility-date=<date>] [--compatibility-flags=a,b] [--kv=BINDING=<namespace-id>] [--vars=<json>] [--bindings=<json>]` | Upload (create or update) a Worker script |
-| `workers download --name=<script> [--file=<path>]` | Download a Worker script |
+| `workers download --name=<script> [--file=<path>] [--raw]` | Download a Worker script (first module of an ES module Worker; --raw keeps the multipart body) |
 | `workers delete --name=<script> [--force]` | Delete a Worker script |
 | `workers secret-list --name=<script>` | List the secrets of a Worker |
 | `workers secret-set --name=<script> --secret-name=<NAME> (--secret-value=<v> \| --from-env=<VAR>)` | Set a secret on a Worker |
@@ -527,8 +529,8 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 | `pages get --project=<name>` | Show a Pages project |
 | `pages create --project=<name> [--production-branch=main]` | Create a Pages project (direct upload) |
 | `pages delete --project=<name>` | Delete a Pages project |
-| `pages deployments --project=<name> [--env=production\|preview]` | List deployments |
-| `pages deploy --project=<name> [--branch=<branch>] [--dir=<build-dir>] [--commit-message=<text>]` | Trigger a build (git projects) or upload --dir with wrangler |
+| `pages deployments --project=<name> [--environment=production\|preview] (alias: --env)` | List deployments |
+| `pages deploy --project=<name> [--branch=<branch>] [--dir=<build-dir>] [--commit-message=<text>] [--install-wrangler]` | Trigger a build (git projects) or upload --dir with wrangler (pinned major 4) |
 | `pages deployment --project=<name> --deployment=<id>` | Show a deployment |
 | `pages logs --project=<name> --deployment=<id>` | Show deployment build logs |
 | `pages retry --project=<name> --deployment=<id>` | Retry a deployment |
@@ -550,7 +552,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 | `tunnel token (--name=<tunnel> \| --id=<tunnel-id>)` | Print the connector token (cloudflared tunnel run --token ...) |
 | `tunnel config (--name=<tunnel> \| --id=<tunnel-id>)` | Show the remote ingress configuration |
 | `tunnel config-set (--name=<tunnel> \| --id=<tunnel-id>) (--ingress=host=service,... \| --file=<config.json>)` | Replace the remote ingress configuration |
-| `tunnel route (--name=<tunnel> \| --id=<tunnel-id>) --hostname=<host> [--service=<url>]` | Publish a hostname: DNS CNAME to the tunnel (+ ingress entry when --service is given) |
+| `tunnel route (--name=<tunnel> \| --id=<tunnel-id>) --hostname=<host> [--service=<url>] [--path=<prefix>]` | Publish a hostname: DNS CNAME to the tunnel (+ ingress entry when --service is given, other entries kept) |
 | `tunnel connections (--name=<tunnel> \| --id=<tunnel-id>)` | List active connections |
 | `tunnel cleanup (--name=<tunnel> \| --id=<tunnel-id>)` | Clean up stale connections |
 
@@ -671,7 +673,13 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 
 | Command | Description |
 |---|---|
-| `batch run (--file=<commands.txt> \| --stdin \| --commands=<multi-line>) [--continue-on-error]` | Run many commands (one per line, # comments allowed) |
+| `batch run (--file=<commands.txt> \| --stdin \| --commands=<multi-line>) [--continue-on-error]` | Run many commands (one per line, # comments allowed; lines are tokenised, never evaluated) |
+
+#### `exec`
+
+| Command | Description |
+|---|---|
+| `exec line --line=<command line>` | Run one command line given as a single string (tokenised safely, never evaluated); used by the GitHub Action |
 
 ## GitHub Action
 
@@ -695,8 +703,10 @@ jobs:
       - run: echo "record ${{ steps.dns.outputs.id }} in zone ${{ steps.dns.outputs.zone-id }}"
 ```
 
-Several changes in one step (batch mode; stops at the first failure unless
-`continue-on-error: true`):
+The `command` input is split into arguments like a shell would (quotes are honoured) but never
+evaluated: `$(...)`, backticks and variables stay literal text. Several changes in one step (batch
+mode; stops at the first failure unless `continue-on-error: true`; the `field` input applies to
+single commands only):
 
 ```yaml
       - uses: octoleo/octoflare@master
@@ -761,8 +771,10 @@ Any CI system can use the installer:
 
 ## Batch files
 
-A batch file holds one command per line (`#` comments allowed). Options given to `batch run`
-apply to every line, and the run stops at the first failure unless `--continue-on-error` is set:
+A batch file holds one command per line (`#` comments allowed, CRLF accepted). Lines are
+tokenised like a shell would (quotes are honoured) but never evaluated. Options given to
+`batch run` apply to every line, and the run stops at the first failure unless
+`--continue-on-error` is set:
 
 ```shell
 octoflare batch run --domain=example.com --file=examples/batch/site.txt
@@ -773,7 +785,8 @@ EOT
 ```
 
 The result lists every command with its exit code and output; the exit code is non-zero when any
-command failed.
+command failed. `octoflare exec --line="dns upsert --name=www ..."` runs a single command line
+given as one string the same way (this is what the GitHub Action uses).
 
 ## Unattended mode and self-installation
 

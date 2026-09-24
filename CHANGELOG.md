@@ -2,8 +2,7 @@
 
 ## Unreleased
 
-Hardening from an adversarial review of 2.0.0 (core, transport, rules, DNS and settings so
-far; Workers/Pages/Tunnel, account-level modules and the action packaging are still to come).
+Hardening from an adversarial review of 2.0.0.
 
 ### Fixed
 * `bot ai-bots block` sent `disabled`; the value is now validated (block, disabled,
@@ -29,8 +28,26 @@ far; Workers/Pages/Tunnel, account-level modules and the action packaging are st
   variables win over the file, quoted values followed by comments and CRLF parse correctly,
   `OCTOFLARE_*` switches can come from the file.
 * GitHub Actions: annotations and masks go to stderr (stdout stays valid JSON), `exit_code` is
-  written even when a command dies, bootstrap failures are annotated, batch lines are tokenised
-  without `eval` (core helper; the action packaging still needs the matching change).
+  written even when a command dies, bootstrap failures are annotated. The action no longer
+  evaluates the `command` input: single commands run through the new `exec --line=` command
+  (tokenised, quotes honoured, `$(...)` literal), block scalars with a trailing newline are
+  single commands, `field` applies to single commands only and `continue-on-error` to every
+  batch. Batch lines are tokenised without `eval` and CRLF lines are accepted; example workflows
+  pass step outputs through environment variables.
+* Workers/KV/Pages/Tunnel: `workers upload` keeps secrets (and vars/KV bindings that were not
+  given) instead of dropping them on every re-upload, and sends its metadata from a file;
+  `workers download` unwraps ES-module (multipart) responses; `kv put` uploads values from files
+  (binary-safe, no `;`/`<` surprises, no argv size limit); `pages deployments` filters with
+  `--environment`; `pages deploy --dir` pins wrangler 4, needs `--install-wrangler` to fetch it
+  unattended and needs nothing in dry runs; `tunnel create` masks the secret; `tunnel route`
+  keeps the whole tunnel configuration and replaces only the entry with the same hostname and
+  path (`--path`).
+* Account-level modules: `list remove` matches hostname, redirect and ASN items; `api` resolves
+  `{zone_id}`/`{account_id}` before sending (a failed lookup fails the command); `r2 list` reads
+  the buckets object and follows the cursor; `bulk-redirect enable|disable` accept `--name`;
+  analytics dates fall back to jq on systems without GNU/BSD date arithmetic.
+* Packaging: the release installer pins the tag instead of master; the single-file bundle keeps
+  the bootstrap helpers ahead of the modules.
 * Bootstrap: downloads have timeouts, the third-party static curl fallback is gone, the static jq
   fallback is pinned and checksum-verified, `/tmp` is never used as the data directory,
   `self uninstall` refuses to delete unrelated directories, `self install-deps` treats openssl

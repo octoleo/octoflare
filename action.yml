@@ -10,7 +10,8 @@ inputs:
   command:
     description: >-
       The Octoflare command to run, e.g. "dns upsert --name=www --type=A --content=203.0.113.10 --proxied".
-      Quote values that contain spaces as you would in a shell.
+      Quote values that contain spaces as you would in a shell; the line is tokenised by Octoflare and
+      never evaluated by a shell ($(...) and backticks stay literal).
     required: false
     default: ''
   commands:
@@ -56,7 +57,7 @@ inputs:
     required: false
     default: 'json'
   field:
-    description: 'jq expression to extract from the result (e.g. ".id"). The extracted value becomes the "result" output.'
+    description: 'jq expression to extract from the result (e.g. ".id"). The extracted value becomes the "result" output. Single commands only.'
     required: false
     default: ''
   dry-run:
@@ -147,7 +148,6 @@ runs:
         [ -n "$INPUT_API_KEY" ] && export CLOUDFLARE_API_KEY="$INPUT_API_KEY"
         [ -n "$INPUT_ORIGIN_CA_KEY" ] && export CLOUDFLARE_ORIGIN_CA_KEY="$INPUT_ORIGIN_CA_KEY"
         [ -n "$INPUT_ENV_FILE" ] && export OCTOFLARE_ENV_FILE="$INPUT_ENV_FILE"
-        [ -n "$INPUT_FIELD" ] && export OCTOFLARE_FIELD="$INPUT_FIELD"
         export OCTOFLARE_OUTPUT="${INPUT_OUTPUT:-json}"
         export OCTOFLARE_DRY_RUN="$INPUT_DRY_RUN"
         export OCTOFLARE_QUIET="$INPUT_QUIET"
@@ -158,22 +158,29 @@ runs:
         export OCTOFLARE_GITHUB_OUTPUT=true
         export OCTOFLARE_COLOR=never
         OCTOFLARE="${GITHUB_ACTION_PATH}/src/octoflare"
+        extra=""
+        [ "$INPUT_CONTINUE_ON_ERROR" = "true" ] && extra="--continue-on-error"
 
-        if [ -n "$OCTOFLARE_COMMANDS" ]; then
-          extra=""
-          [ "$INPUT_CONTINUE_ON_ERROR" = "true" ] && extra="--continue-on-error"
-          printf '%s\n' "$OCTOFLARE_COMMANDS" | bash "$OCTOFLARE" batch run --stdin $extra
-        elif [ -n "$OCTOFLARE_COMMAND" ]; then
-          case "$OCTOFLARE_COMMAND" in
+        # trim blank lines and surrounding whitespace (a YAML block scalar ends with a newline)
+        trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+        cmd="$(trim "$OCTOFLARE_COMMAND")"
+        cmds="$(trim "$OCTOFLARE_COMMANDS")"
+
+        if [ -n "$cmds" ]; then
+          # batch mode: one command per line; the field input does not apply to a batch summary
+          printf '%s\n' "$cmds" | bash "$OCTOFLARE" batch run --stdin $extra
+        elif [ -n "$cmd" ]; then
+          case "$cmd" in
             *$'\n'*)
-              printf '%s\n' "$OCTOFLARE_COMMAND" | bash "$OCTOFLARE" batch run --stdin
+              printf '%s\n' "$cmd" | bash "$OCTOFLARE" batch run --stdin $extra
               ;;
             *)
-              eval "set -- $OCTOFLARE_COMMAND"
-              bash "$OCTOFLARE" "$@"
+              # the command line is tokenised by Octoflare (quotes honoured), never evaluated by a shell
+              [ -n "$INPUT_FIELD" ] && export OCTOFLARE_FIELD="$INPUT_FIELD"
+              bash "$OCTOFLARE" exec --line="$cmd"
               ;;
           esac
         else
-          echo "::error title=Octoflare::Provide the 'command' or 'commands' input."
+          echo "::error title=Octoflare::Provide the 'command' or 'commands' input." >&2
           exit 64
         fi

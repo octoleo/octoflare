@@ -46,4 +46,6 @@ jobs:
           command: batch run --file=examples/batch/site.txt
 
       - name: Summary
-        run: echo '${{ steps.batch.outputs.result }}' | jq '{total, failed}'
+        env:
+          RESULT: ${{ steps.batch.outputs.result }}
+        run: printf '%s' "$RESULT" | jq '{total, failed}'

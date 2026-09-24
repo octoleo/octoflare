@@ -12,8 +12,8 @@ registerCommand pages list "" "List Pages projects"
 registerCommand pages get "--project=<name>" "Show a Pages project"
 registerCommand pages create "--project=<name> [--production-branch=main]" "Create a Pages project (direct upload)"
 registerCommand pages delete "--project=<name>" "Delete a Pages project"
-registerCommand pages deployments "--project=<name> [--env=production|preview]" "List deployments"
-registerCommand pages deploy "--project=<name> [--branch=<branch>] [--dir=<build-dir>] [--commit-message=<text>]" "Trigger a build (git projects) or upload --dir with wrangler"
+registerCommand pages deployments "--project=<name> [--environment=production|preview] (alias: --env)" "List deployments"
+registerCommand pages deploy "--project=<name> [--branch=<branch>] [--dir=<build-dir>] [--commit-message=<text>] [--install-wrangler]" "Trigger a build (git projects) or upload --dir with wrangler (pinned major 4)"
 registerCommand pages deployment "--project=<name> --deployment=<id>" "Show a deployment"
 registerCommand pages logs "--project=<name> --deployment=<id>" "Show deployment build logs"
 registerCommand pages retry "--project=<name> --deployment=<id>" "Retry a deployment"
@@ -78,7 +78,7 @@ cmd_pages_delete() {
 cmd_pages_deployments() {
   resolveAccount
   pagesProject >/dev/null || exit $?
-  cfApiList "/accounts/${CF_ACCOUNT_ID}/pages/projects/$(pagesProject)/deployments" "$(cfQuery "env=$(opt env)")"
+  cfApiList "/accounts/${CF_ACCOUNT_ID}/pages/projects/$(pagesProject)/deployments" "$(cfQuery "env=$(optFirst "" environment deployment-env env)")"
   emitResult "$(cfResult)" "$PAGES_DEPLOY_TEMPLATE" "No deployments."
 }
 
@@ -126,21 +126,28 @@ cmd_pages_delete_deployment() {
   emitMessage "Deployment $(pagesDeployment) deleted." "$(jq -cn --arg id "$(pagesDeployment)" '{id:$id}')"
 }
 
-# wranglerCmd - Print the wrangler command to use, installing it in unattended mode when missing
+WRANGLER_VERSION="${OCTOFLARE_WRANGLER_VERSION:-4}"
+
+# wranglerCmd - Print the wrangler command to use. A missing wrangler is only fetched (pinned to
+# WRANGLER_VERSION through npx) when --install-wrangler is given or the run is interactive;
+# unattended runs must opt in explicitly so that CI never executes an unpinned download.
 wranglerCmd() {
   if hasCmd wrangler; then
     echo "wrangler"
     return 0
   fi
+  if [[ "$OCTOFLARE_UNATTENDED" == "true" && "$(optBool install-wrangler)" != "true" ]]; then
+    die "wrangler is not installed. Install it (npm install -g wrangler@${WRANGLER_VERSION}) or pass --install-wrangler to let npx fetch wrangler@${WRANGLER_VERSION}." "$EX_UNAVAILABLE"
+  fi
   if hasCmd npx; then
-    echo "npx --yes wrangler@latest"
+    echo "npx --yes wrangler@${WRANGLER_VERSION}"
     return 0
   fi
   if hasCmd npm; then
-    logInfo "Installing wrangler with npm..."
-    npm install -g wrangler >/dev/null 2>&1 && hasCmd wrangler && { echo "wrangler"; return 0; }
+    logInfo "Installing wrangler@${WRANGLER_VERSION} with npm..."
+    npm install -g "wrangler@${WRANGLER_VERSION}" >/dev/null 2>&1 && hasCmd wrangler && { echo "wrangler"; return 0; }
   fi
-  die "wrangler is required to upload a directory to Pages. Install Node.js (npm/npx) or wrangler and try again." "$EX_UNAVAILABLE"
+  die "wrangler is required to upload a directory to Pages. Install Node.js (npm/npx) or wrangler@${WRANGLER_VERSION} and try again." "$EX_UNAVAILABLE"
 }
 
 cmd_pages_deploy() {
@@ -151,13 +158,13 @@ cmd_pages_deploy() {
   dir="$(optFirst "" dir directory)"
   if [[ -n "$dir" ]]; then
     [[ -d "$dir" ]] || die "Build directory not found: ${dir}" "$EX_ARGS"
-    cmd="$(wranglerCmd)" || exit $?
     msg="$(opt commit-message)"
-    logInfo "Uploading ${dir} to Pages project ${project} with wrangler..."
     if [[ "$OCTOFLARE_DRY_RUN" == "true" ]]; then
-      emitMessage "[dry-run] ${cmd} pages deploy ${dir} --project-name=${project}${branch:+ --branch=${branch}}"
+      emitMessage "[dry-run] wrangler pages deploy ${dir} --project-name=${project}${branch:+ --branch=${branch}}"
       return 0
     fi
+    cmd="$(wranglerCmd)" || exit $?
+    logInfo "Uploading ${dir} to Pages project ${project} with wrangler..."
     # shellcheck disable=SC2086
     CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID" $cmd pages deploy "$dir" --project-name="$project" ${branch:+--branch="$branch"} ${msg:+--commit-message="$msg"} || die "wrangler pages deploy failed" "$EX_FAILURE"
     cfApiList "/accounts/${CF_ACCOUNT_ID}/pages/projects/${project}/deployments"
