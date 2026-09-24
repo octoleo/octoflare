@@ -176,7 +176,7 @@ setup() { setup_env; }
   export GITHUB_ACTIONS=true
   export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out.txt"
   : > "$GITHUB_OUTPUT"
-  run "$OCTOFLARE" batch run --domain=example.com --commands=$'zone id\ndns list --domain=nope.invalid' --json --quiet --continue-on-error
+  run --separate-stderr "$OCTOFLARE" batch run --domain=example.com --commands=$'zone id\ndns list --domain=nope.invalid' --json --quiet --continue-on-error
   [ "$status" -eq 1 ]
   [ "$(printf '%s\n' "$output" | grep -c '^::add-mask::test-token$')" -eq 1 ]
   printf '%s\n' "$output" | grep -q '^::error title=Octoflare::'

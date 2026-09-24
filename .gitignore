@@ -1,6 +1,5 @@
 .idea
 tests/.bats/
-tests/.mock.log
 dist/
 .octoflare
 .env

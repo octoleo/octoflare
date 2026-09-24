@@ -33,14 +33,15 @@ fi
 
 # mock API on a free port
 PORT="${MOCK_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')}"
-python3 tests/mock_api.py "$PORT" "$ROOT" >tests/.mock.log 2>&1 &
+MOCK_LOG="$(mktemp "${TMPDIR:-/tmp}/octoflare-mock.XXXXXX")"
+python3 tests/mock_api.py "$PORT" "$ROOT" >"$MOCK_LOG" 2>&1 &
 MOCK_PID=$!
-trap 'kill "$MOCK_PID" 2>/dev/null || true' EXIT
+trap 'kill "$MOCK_PID" 2>/dev/null || true; rm -f "$MOCK_LOG"' EXIT
 for _ in $(seq 1 100); do
   curl -s "http://127.0.0.1:${PORT}/__health" >/dev/null 2>&1 && break
   sleep 0.1
 done
-curl -s "http://127.0.0.1:${PORT}/__health" >/dev/null 2>&1 || { echo "mock API did not start (see tests/.mock.log)" >&2; exit 1; }
+curl -s "http://127.0.0.1:${PORT}/__health" >/dev/null 2>&1 || { echo "mock API did not start:" >&2; cat "$MOCK_LOG" >&2; exit 1; }
 
 export MOCK_PORT="$PORT"
 export OCTOFLARE_ROOT="$ROOT"

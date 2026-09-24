@@ -118,7 +118,10 @@ setup() { setup_env; }
   run --separate-stderr env OCTOFLARE_RAW_BASE="${MOCK}/raw" OCTOFLARE_HOME="$BATS_TEST_TMPDIR/home" "$BATS_TEST_TMPDIR/ro/octoflare" version
   chmod 755 "$BATS_TEST_TMPDIR/ro"
   [ "$status" -eq 0 ]
-  [ -f "$BATS_TEST_TMPDIR/home/lib/core.sh" ]
+  [[ "$stderr" == *"Installing missing Octoflare modules"* ]]
+  # first writable fallback wins: <script dir>/../lib/octoflare, then OCTOFLARE_HOME/lib
+  [ -f "$BATS_TEST_TMPDIR/lib/octoflare/core.sh" ] || [ -f "$BATS_TEST_TMPDIR/home/lib/core.sh" ]
+  [ ! -e "$BATS_TEST_TMPDIR/ro/lib/core.sh" ]
 }
 
 @test "a missing dependency is reported (exit 69) when it cannot be installed" {
