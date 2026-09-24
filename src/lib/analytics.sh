@@ -13,7 +13,8 @@ registerCommand analytics query "--query=<graphql|@file> [--variables=<json>]" "
 
 # graphql - POST a GraphQL query with variables
 graphql() {
-  local query="$1" variables="${2:-{\}}"
+  local query="$1" variables="${2:-}"
+  [[ -z "$variables" ]] && variables='{}'
   cfApi POST "/graphql" "$(jq -cn --arg q "$query" --argjson v "$variables" '{query:$q, variables:$v}')"
   if printf '%s' "$CF_RESPONSE" | jq -e '.errors and (.errors|length) > 0' >/dev/null 2>&1; then
     logError "GraphQL query failed:"
