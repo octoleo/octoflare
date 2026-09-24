@@ -1,0 +1,179 @@
+name: 'Octoflare - Cloudflare automation'
+description: 'Manage Cloudflare from a workflow: DNS, redirects, cache, security, rules, SSL, Workers, Pages, Tunnels, Email Routing, R2 and more.'
+author: 'Llewellyn van der Merwe'
+
+branding:
+  icon: 'cloud'
+  color: 'orange'
+
+inputs:
+  command:
+    description: >-
+      The Octoflare command to run, e.g. "dns upsert --name=www --type=A --content=203.0.113.10 --proxied".
+      Quote values that contain spaces as you would in a shell.
+    required: false
+    default: ''
+  commands:
+    description: >-
+      Several commands, one per line, executed in order (batch mode). Lines starting with # are ignored.
+      Use this instead of "command" for multi-step changes.
+    required: false
+    default: ''
+  api-token:
+    description: 'Cloudflare API token. Alternatively set the CLOUDFLARE_API_TOKEN environment variable from a secret.'
+    required: false
+    default: ''
+  account-id:
+    description: 'Cloudflare account ID (needed for account-level features when the token can see several accounts).'
+    required: false
+    default: ''
+  zone-id:
+    description: 'Zone ID. Skips the zone lookup when given.'
+    required: false
+    default: ''
+  domain:
+    description: 'Default zone (domain) for zone-level commands.'
+    required: false
+    default: ''
+  email:
+    description: 'Cloudflare account email (legacy global API key authentication only).'
+    required: false
+    default: ''
+  api-key:
+    description: 'Cloudflare global API key (legacy authentication, use api-token instead).'
+    required: false
+    default: ''
+  origin-ca-key:
+    description: 'Origin CA key for "ssl origin-cert-*" commands (optional, an API token also works).'
+    required: false
+    default: ''
+  env-file:
+    description: 'Path to a .env file in the checked-out repository. Its values never override existing environment variables.'
+    required: false
+    default: ''
+  output:
+    description: 'Output format: json or text.'
+    required: false
+    default: 'json'
+  field:
+    description: 'jq expression to extract from the result (e.g. ".id"). The extracted value becomes the "result" output.'
+    required: false
+    default: ''
+  dry-run:
+    description: 'Show the API requests that would be made without sending them.'
+    required: false
+    default: 'false'
+  continue-on-error:
+    description: 'Batch mode only: keep running the remaining commands after a failure.'
+    required: false
+    default: 'false'
+  quiet:
+    description: 'Suppress informational log lines.'
+    required: false
+    default: 'false'
+  debug:
+    description: 'Verbose logging (requests and bodies). Secrets are masked.'
+    required: false
+    default: 'false'
+  timeout:
+    description: 'HTTP timeout in seconds per request.'
+    required: false
+    default: '60'
+  retries:
+    description: 'Number of retries for rate-limited or failed requests.'
+    required: false
+    default: '3'
+  working-directory:
+    description: 'Directory to run in (for relative --file paths and env files).'
+    required: false
+    default: '.'
+
+outputs:
+  result:
+    description: 'JSON result of the command (or the --field value). In batch mode: {total, succeeded, failed, results:[...]}.'
+    value: ${{ steps.octoflare.outputs.result }}
+  id:
+    description: 'ID of the created/updated object when the result has one.'
+    value: ${{ steps.octoflare.outputs.id }}
+  zone-id:
+    description: 'Resolved zone ID.'
+    value: ${{ steps.octoflare.outputs.zone_id }}
+  zone-name:
+    description: 'Resolved zone name.'
+    value: ${{ steps.octoflare.outputs.zone_name }}
+  account-id:
+    description: 'Resolved account ID.'
+    value: ${{ steps.octoflare.outputs.account_id }}
+  exit-code:
+    description: 'Exit code of Octoflare.'
+    value: ${{ steps.octoflare.outputs.exit_code }}
+  failed:
+    description: 'Batch mode: number of failed commands.'
+    value: ${{ steps.octoflare.outputs.failed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Octoflare
+      id: octoflare
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        OCTOFLARE_COMMAND: ${{ inputs.command }}
+        OCTOFLARE_COMMANDS: ${{ inputs.commands }}
+        INPUT_API_TOKEN: ${{ inputs.api-token }}
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_ZONE_ID: ${{ inputs.zone-id }}
+        INPUT_DOMAIN: ${{ inputs.domain }}
+        INPUT_EMAIL: ${{ inputs.email }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_ORIGIN_CA_KEY: ${{ inputs.origin-ca-key }}
+        INPUT_ENV_FILE: ${{ inputs.env-file }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_FIELD: ${{ inputs.field }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_CONTINUE_ON_ERROR: ${{ inputs.continue-on-error }}
+        INPUT_QUIET: ${{ inputs.quiet }}
+        INPUT_DEBUG: ${{ inputs.debug }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_RETRIES: ${{ inputs.retries }}
+      run: |
+        set -uo pipefail
+        [ -n "$INPUT_API_TOKEN" ] && export CLOUDFLARE_API_TOKEN="$INPUT_API_TOKEN"
+        [ -n "$INPUT_ACCOUNT_ID" ] && export CLOUDFLARE_ACCOUNT_ID="$INPUT_ACCOUNT_ID"
+        [ -n "$INPUT_ZONE_ID" ] && export CLOUDFLARE_ZONE_ID="$INPUT_ZONE_ID"
+        [ -n "$INPUT_DOMAIN" ] && export CLOUDFLARE_DOMAIN="$INPUT_DOMAIN"
+        [ -n "$INPUT_EMAIL" ] && export CLOUDFLARE_EMAIL="$INPUT_EMAIL"
+        [ -n "$INPUT_API_KEY" ] && export CLOUDFLARE_API_KEY="$INPUT_API_KEY"
+        [ -n "$INPUT_ORIGIN_CA_KEY" ] && export CLOUDFLARE_ORIGIN_CA_KEY="$INPUT_ORIGIN_CA_KEY"
+        [ -n "$INPUT_ENV_FILE" ] && export OCTOFLARE_ENV_FILE="$INPUT_ENV_FILE"
+        [ -n "$INPUT_FIELD" ] && export OCTOFLARE_FIELD="$INPUT_FIELD"
+        export OCTOFLARE_OUTPUT="${INPUT_OUTPUT:-json}"
+        export OCTOFLARE_DRY_RUN="$INPUT_DRY_RUN"
+        export OCTOFLARE_QUIET="$INPUT_QUIET"
+        export OCTOFLARE_DEBUG="$INPUT_DEBUG"
+        export OCTOFLARE_TIMEOUT="$INPUT_TIMEOUT"
+        export OCTOFLARE_RETRIES="$INPUT_RETRIES"
+        export OCTOFLARE_UNATTENDED=true
+        export OCTOFLARE_GITHUB_OUTPUT=true
+        export OCTOFLARE_COLOR=never
+        OCTOFLARE="${GITHUB_ACTION_PATH}/src/octoflare"
+
+        if [ -n "$OCTOFLARE_COMMANDS" ]; then
+          extra=""
+          [ "$INPUT_CONTINUE_ON_ERROR" = "true" ] && extra="--continue-on-error"
+          printf '%s\n' "$OCTOFLARE_COMMANDS" | bash "$OCTOFLARE" batch run --stdin $extra
+        elif [ -n "$OCTOFLARE_COMMAND" ]; then
+          case "$OCTOFLARE_COMMAND" in
+            *$'\n'*)
+              printf '%s\n' "$OCTOFLARE_COMMAND" | bash "$OCTOFLARE" batch run --stdin
+              ;;
+            *)
+              eval "set -- $OCTOFLARE_COMMAND"
+              bash "$OCTOFLARE" "$@"
+              ;;
+          esac
+        else
+          echo "::error title=Octoflare::Provide the 'command' or 'commands' input."
+          exit 64
+        fi

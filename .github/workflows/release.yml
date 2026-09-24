@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build bundle and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build single-file bundle
+        run: |
+          scripts/bundle.sh dist/octoflare
+          cp install.sh dist/install.sh
+          (cd dist && sha256sum octoflare install.sh > SHA256SUMS)
+      - name: Smoke test
+        env:
+          CLOUDFLARE_API_TOKEN: dummy-token
+          OCTOFLARE_DRY_RUN: 'true'
+        run: dist/octoflare --version && dist/octoflare help --json --quiet | jq 'length'
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/octoflare
+            dist/install.sh
+            dist/SHA256SUMS
+          generate_release_notes: true

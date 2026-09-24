@@ -1,0 +1,28 @@
+# Purge the Cloudflare cache after a successful deployment.
+#
+# Secrets: CLOUDFLARE_API_TOKEN (Zone:Read, Cache Purge)
+name: Purge cache after deploy
+
+on:
+  workflow_run:
+    workflows: ['Deploy']
+    types: [completed]
+
+jobs:
+  purge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge everything
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+          command: cache purge --everything
+
+      # Or purge specific URLs only:
+      # - uses: octoleo/octoflare@master
+      #   with:
+      #     api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      #     domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+      #     command: cache purge --urls=https://example.com/,https://example.com/app.css

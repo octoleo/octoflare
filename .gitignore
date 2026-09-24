@@ -1,1 +1,7 @@
 .idea
+tests/.bats/
+tests/.mock.log
+dist/
+.octoflare
+.env
+__pycache__/

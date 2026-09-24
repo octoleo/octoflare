@@ -1,0 +1,38 @@
+# After a Pages deployment: attach a custom domain, create the DNS record and purge the cache.
+#
+# Secrets: CLOUDFLARE_API_TOKEN (Account: Cloudflare Pages:Edit, Zone: DNS:Edit, Cache Purge)
+name: Pages custom domain
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Pages project name'
+        required: true
+      hostname:
+        description: 'Custom hostname (e.g. www.example.com)'
+        required: true
+
+jobs:
+  domain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger a production build
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy --project=${{ inputs.project }} --branch=main
+
+      - name: Attach the domain and create the CNAME
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages domain-add --project=${{ inputs.project }} --name=${{ inputs.hostname }} --dns
+
+      - name: Purge the cache of the hostname
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: cache purge --domain=${{ inputs.hostname }} --everything

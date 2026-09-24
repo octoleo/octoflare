@@ -1,0 +1,40 @@
+# Create or update a single redirect (rules engine, free plan: 10 rules).
+#
+# Secrets: CLOUDFLARE_API_TOKEN (Zone:Read, Zone WAF:Edit / Single Redirect:Edit)
+name: Manage redirect
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: 'Source path, URL or hostname (e.g. /old-page, old.example.com or /blog/*)'
+        required: true
+      to:
+        description: 'Target URL (use ${1} with wildcards, e.g. https://example.com/news/${1})'
+        required: true
+      status:
+        description: 'HTTP status code'
+        default: '301'
+      remove:
+        description: 'Remove the redirect instead of creating it'
+        type: boolean
+        default: false
+
+jobs:
+  redirect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upsert redirect
+        if: ${{ !inputs.remove }}
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+          command: redirect upsert --from='${{ inputs.from }}' --to='${{ inputs.to }}' --status=${{ inputs.status }} --preserve-query
+      - name: Delete redirect
+        if: ${{ inputs.remove }}
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+          command: redirect delete --from='${{ inputs.from }}' --if-exists

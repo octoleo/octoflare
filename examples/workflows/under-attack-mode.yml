@@ -1,0 +1,26 @@
+# Toggle "I'm Under Attack" mode from a workflow (manual or from monitoring).
+#
+# Secrets: CLOUDFLARE_API_TOKEN (Zone:Read, Zone Settings:Edit)
+name: Under attack mode
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'enable, disable or status'
+        default: 'status'
+        type: choice
+        options: [enable, disable, status]
+      domain:
+        description: 'Zone'
+        required: true
+
+jobs:
+  attack-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          domain: ${{ inputs.domain }}
+          command: attack-mode ${{ inputs.action }} --restore-level=high

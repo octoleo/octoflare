@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint
+        run: shellcheck --version && shellcheck src/octoflare src/lib/*.sh install.sh scripts/*.sh tests/*.sh
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test suite
+        run: tests/run.sh
+
+  bundle:
+    name: Single-file bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bundle
+        run: scripts/bundle.sh dist/octoflare
+      - name: Smoke test bundle
+        env:
+          CLOUDFLARE_API_TOKEN: dummy-token
+          OCTOFLARE_DRY_RUN: 'true'
+        run: |
+          dist/octoflare --version
+          dist/octoflare dns upsert --domain=example.com --name=www --type=A --content=203.0.113.10 --json --quiet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octoflare-bundle
+          path: dist/octoflare
+
+  action:
+    name: Action self-test (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Single command
+        id: single
+        uses: ./
+        with:
+          api-token: dummy-token
+          domain: example.com
+          dry-run: true
+          command: dns upsert --name=www --type=A --content=203.0.113.10 --proxied --comment="set by CI"
+      - name: Check outputs
+        env:
+          RESULT: ${{ steps.single.outputs.result }}
+          ZONE_ID: ${{ steps.single.outputs.zone-id }}
+          EXIT_CODE: ${{ steps.single.outputs.exit-code }}
+        run: |
+          echo "result=$RESULT"
+          test "$EXIT_CODE" = "0"
+          test "$ZONE_ID" = "dry-run-zone-id"
+          echo "$RESULT" | jq -e '.name == "www.example.com" and .comment == "set by CI" and .proxied == true'
+      - name: Batch commands
+        id: batch
+        uses: ./
+        with:
+          api-token: dummy-token
+          domain: example.com
+          dry-run: true
+          commands: |
+            # provision a subdomain and lock it down
+            dns upsert --name=app --type=CNAME --content=app.pages.dev --proxied
+            redirect upsert --from=/old --to=https://example.com/new --status=301
+            setting set --name=ssl --value=strict
+            cache purge --everything
+      - name: Check batch outputs
+        env:
+          RESULT: ${{ steps.batch.outputs.result }}
+          FAILED: ${{ steps.batch.outputs.failed }}
+        run: |
+          test "$FAILED" = "0"
+          echo "$RESULT" | jq -e '.total == 4 and .failed == 0'
+      - name: Field extraction
+        id: field
+        uses: ./
+        with:
+          api-token: dummy-token
+          dry-run: true
+          command: zone id --domain=example.com
+          field: .id
+      - name: Check field output
+        run: test "${{ steps.field.outputs.result }}" = "dry-run-zone-id"

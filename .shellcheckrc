@@ -1,0 +1,7 @@
+# Octoflare shellcheck configuration
+# The CLI is split into modules that are sourced by src/octoflare at runtime,
+# so variables and functions are legitimately shared across files.
+shell=bash
+external-sources=true
+source-path=SCRIPTDIR
+disable=SC2034,SC2153,SC1091

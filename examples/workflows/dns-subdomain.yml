@@ -1,0 +1,41 @@
+# Point a subdomain at a new target (create or update the record).
+#
+# Secrets: CLOUDFLARE_API_TOKEN (Zone:Read, DNS:Edit)
+# Variables: CLOUDFLARE_DOMAIN (e.g. example.com)
+name: Set subdomain
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'Record name (e.g. app or app.example.com)'
+        required: true
+      type:
+        description: 'Record type'
+        default: 'CNAME'
+      content:
+        description: 'Target (IP or hostname)'
+        required: true
+      proxied:
+        description: 'Proxy through Cloudflare'
+        type: boolean
+        default: true
+
+jobs:
+  dns:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upsert DNS record
+        id: dns
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+          command: >-
+            dns upsert --name=${{ inputs.name }} --type=${{ inputs.type }}
+            --content=${{ inputs.content }} --proxied=${{ inputs.proxied }}
+            --comment="set by ${{ github.workflow }} run ${{ github.run_id }}"
+      - name: Show result
+        run: |
+          echo "record id: ${{ steps.dns.outputs.id }}"
+          echo '${{ steps.dns.outputs.result }}' | jq .

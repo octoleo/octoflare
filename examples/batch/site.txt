@@ -1,0 +1,24 @@
+# Octoflare batch file: one command per line, run with
+#   octoflare batch run --domain=example.com --file=examples/batch/site.txt
+# Options given to "batch run" (e.g. --domain) apply to every line.
+
+# DNS
+dns upsert --name=@ --type=A --content=203.0.113.10 --proxied
+dns upsert --name=www --type=CNAME --content=example.com --proxied
+dns upsert --name=@ --type=TXT --content="v=spf1 include:_spf.google.com ~all"
+
+# TLS
+ssl mode strict
+ssl always-https on
+ssl auto-rewrites on
+ssl min-tls 1.2
+
+# Performance
+setting apply --settings='{"brotli":"on","early_hints":"on","http3":"on","0rtt":"on"}'
+cache level aggressive
+cache browser-ttl 14400
+
+# Security
+attack-mode level --level=medium
+bot fight-mode on
+access-rule block --value=AS64496 --notes="known bad ASN"

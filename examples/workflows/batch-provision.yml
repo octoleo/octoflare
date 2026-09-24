@@ -1,0 +1,49 @@
+# Apply a whole set of Cloudflare changes in one step (batch mode).
+# The same commands can live in a file in the repository, see examples/batch/site.txt.
+#
+# Secrets: CLOUDFLARE_API_TOKEN, Variables: CLOUDFLARE_DOMAIN, CLOUDFLARE_ACCOUNT_ID
+name: Provision site on Cloudflare
+
+on:
+  workflow_dispatch:
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inline batch
+        id: batch
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          account-id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+          continue-on-error: false
+          commands: |
+            # DNS
+            dns upsert --name=@ --type=A --content=203.0.113.10 --proxied
+            dns upsert --name=www --type=CNAME --content=${{ vars.CLOUDFLARE_DOMAIN }} --proxied
+            dns upsert --name=@ --type=MX --content=route1.mx.cloudflare.net --priority=10
+            # Security & TLS
+            ssl mode strict
+            ssl always-https on
+            ssl min-tls 1.2
+            ssl hsts --max-age=31536000 --include-subdomains
+            bot fight-mode on
+            firewall upsert --action=managed_challenge --paths=/wp-login.php,/xmlrpc.php --description="Challenge login endpoints"
+            # Redirects & cache
+            redirect upsert --from=www.${{ vars.CLOUDFLARE_DOMAIN }} --to=https://${{ vars.CLOUDFLARE_DOMAIN }} --preserve-path --preserve-query
+            cache-rule upsert --expression='http.request.uri.path.extension in {"css" "js" "png" "jpg" "svg" "woff2"}' --edge-ttl=2592000 --browser-ttl=86400
+            cache purge --everything
+
+      - name: Batch from a file in the repo
+        uses: octoleo/octoflare@master
+        with:
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          domain: ${{ vars.CLOUDFLARE_DOMAIN }}
+          command: batch run --file=examples/batch/site.txt
+
+      - name: Summary
+        run: echo '${{ steps.batch.outputs.result }}' | jq '{total, failed}'
