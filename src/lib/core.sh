@@ -653,8 +653,10 @@ emitGitHubOutputs() {
 
 # emitMessage - Emit a simple {"success":true,"message":...} result
 emitMessage() {
-  local msg="$1" extra="${2:-{\}}"
+  local msg="$1" extra="${2:-}"
   local json
+  # (a literal {} inside ${2:-...} is parsed differently by Bash 3.2, so default it here)
+  [[ -z "$extra" ]] && extra='{}'
   json="$(jq -cn --arg m "$msg" --argjson extra "$extra" '{success:true, message:$m} + $extra')"
   if [[ "$OCTOFLARE_OUTPUT" == "json" || -n "$OCTOFLARE_FIELD" ]]; then
     emitResult "$json"

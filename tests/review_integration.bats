@@ -16,11 +16,9 @@ setup() { setup_env; }
 
 @test "the action's shell snippet handles block-scalar commands, quotes and literal expansions" {
   # replay the action's run script locally with the same environment the runner provides
-  python3 - "$OCTOFLARE_ROOT/action.yml" > run.sh <<'PY'
-import sys, yaml
-a = yaml.safe_load(open(sys.argv[1]))
-print(a["runs"]["steps"][0]["run"])
-PY
+  # (the block scalar under "run: |" is the last key of the step; strip its 8-space indent)
+  awk '/^      run: \|$/ {on=1; next} on && /^        / {sub(/^        /, ""); print; next} on && /^[[:space:]]*$/ {print ""; next} on {exit}' "$OCTOFLARE_ROOT/action.yml" > run.sh
+  grep -q 'exec --line=' run.sh
   export GITHUB_ACTION_PATH="$OCTOFLARE_ROOT" GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out.txt"
   export INPUT_API_TOKEN=test-token INPUT_ACCOUNT_ID="" INPUT_ZONE_ID="" INPUT_DOMAIN=example.com INPUT_EMAIL="" INPUT_API_KEY="" INPUT_ORIGIN_CA_KEY="" INPUT_ENV_FILE="" INPUT_OUTPUT=json INPUT_FIELD="" INPUT_DRY_RUN=false INPUT_CONTINUE_ON_ERROR=false INPUT_QUIET=true INPUT_DEBUG=false INPUT_TIMEOUT=60 INPUT_RETRIES=3
   : > "$GITHUB_OUTPUT"
@@ -60,14 +58,6 @@ PY
 }
 
 @test "the release workflow pins the installer to the tag" {
-  GITHUB_REF_NAME=v9.9.9 bash -c "$(python3 - "$OCTOFLARE_ROOT/.github/workflows/release.yml" <<'PY'
-import sys, yaml
-w = yaml.safe_load(open(sys.argv[1]))
-steps = w["jobs"]["release"]["steps"]
-run = next(s["run"] for s in steps if s.get("name") == "Build single-file bundle")
-print("\n".join(l for l in run.splitlines() if "install.sh" in l))
-PY
-)" 2>/dev/null <<< "" || true
   mkdir -p dist
   GITHUB_REF_NAME=v9.9.9 bash -c 'sed "s|^REF=\"\${OCTOFLARE_REF:-master}\"|REF=\"\${OCTOFLARE_REF:-${GITHUB_REF_NAME}}\"|" "$OCTOFLARE_ROOT/install.sh" > dist/install.sh'
   grep -q '^REF="${OCTOFLARE_REF:-v9.9.9}"$' dist/install.sh
