@@ -164,6 +164,26 @@ setup() { setup_env; }
   grep -q '^exit_code=0$' "$GITHUB_OUTPUT"
 }
 
+@test "--field value becomes the GitHub result output" {
+  export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out.txt"
+  : > "$GITHUB_OUTPUT"
+  octo zone id --domain=example.com --field=.id
+  [ "$output" = "zone123" ]
+  grep -q '^result=zone123$' "$GITHUB_OUTPUT"
+}
+
+@test "batch results stay clean JSON under GitHub Actions and annotations are re-emitted" {
+  export GITHUB_ACTIONS=true
+  export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out.txt"
+  : > "$GITHUB_OUTPUT"
+  run "$OCTOFLARE" batch run --domain=example.com --commands=$'zone id\ndns list --domain=nope.invalid' --json --quiet --continue-on-error
+  [ "$status" -eq 1 ]
+  [ "$(printf '%s\n' "$output" | grep -c '^::add-mask::test-token$')" -eq 1 ]
+  printf '%s\n' "$output" | grep -q '^::error title=Octoflare::'
+  printf '%s\n' "$output" | grep -v '^::' | jq -e '.results[0].result.id == "zone123" and .results[1].success == false' >/dev/null
+  grep -q '^failed=1$' "$GITHUB_OUTPUT"
+}
+
 @test "GitHub Actions outputs can be disabled" {
   export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out.txt"
   : > "$GITHUB_OUTPUT"

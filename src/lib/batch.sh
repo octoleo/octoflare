@@ -74,6 +74,11 @@ cmd_batch_run() {
     logInfo "[batch ${total}] octoflare ${line}"
     output="$(runCommand ${global_opts[@]+"${global_opts[@]}"} "${args[@]}" --output=json --github-output=false)"
     code=$?
+    if [[ "$output" == *"::"* ]]; then
+      # GitHub workflow commands (::error::, ::add-mask::) must reach the real stdout, not the result
+      printf '%s\n' "$output" | grep -E '^::' || true
+      output="$(printf '%s\n' "$output" | grep -vE '^::' || true)"
+    fi
     printf '%s' "$output" | jq -e . >/dev/null 2>&1 || output="$(jq -cn --arg o "$output" '$o')"
     results="$(jq -cn --argjson r "$results" --arg c "$line" --argjson code "$code" --argjson o "${output:-null}" '$r + [{command:$c, exit_code:$code, success:($code == 0), result:$o}]')"
     if [[ $code -ne 0 ]]; then

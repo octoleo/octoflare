@@ -424,9 +424,15 @@ ghOutput() {
   fi
 }
 
-# ghMask - Mask a secret in GitHub Actions logs
+GH_MASKED=""
+
+# ghMask - Mask a secret in GitHub Actions logs (once per value)
 ghMask() {
   [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${1:-}" ]] || return 0
+  case "$GH_MASKED" in
+    *"|${1}|"*) return 0 ;;
+  esac
+  GH_MASKED="${GH_MASKED}|${1}|"
   printf '::add-mask::%s\n' "$1"
 }
 
@@ -457,6 +463,8 @@ emitResult() {
   if [[ -n "$OCTOFLARE_FIELD" ]]; then
     out="$(printf '%s' "$json" | jq -r "$OCTOFLARE_FIELD")" || die "Invalid --field expression: ${OCTOFLARE_FIELD}" "$EX_ARGS"
     printf '%s\n' "$out"
+    emitGitHubOutputs "$json" "$out"
+    return 0
   elif [[ "$OCTOFLARE_OUTPUT" == "json" ]]; then
     if [[ "$OCTOFLARE_PRETTY" == "true" ]]; then
       printf '%s' "$json" | jq '.'
@@ -479,10 +487,18 @@ emitResult() {
 }
 
 # emitGitHubOutputs - Write the standard outputs (result, id, zone_id, ...) for workflows
+#
+# Arguments:
+#   $1: JSON result
+#   $2: value to publish as "result" instead of the JSON (the --field value)
 emitGitHubOutputs() {
   ghEnabled || return 0
   local json="$1" id
-  ghOutput result "$(printf '%s' "$json" | jq -c '.')"
+  if [[ $# -ge 2 ]]; then
+    ghOutput result "$2"
+  else
+    ghOutput result "$(printf '%s' "$json" | jq -c '.')"
+  fi
   id="$(printf '%s' "$json" | jq -r 'if type=="object" then (.id // .result.id // empty) else empty end' 2>/dev/null)"
   [[ -n "$id" ]] && ghOutput id "$id"
   [[ -n "${CF_ZONE_ID:-}" ]] && ghOutput zone_id "$CF_ZONE_ID"
