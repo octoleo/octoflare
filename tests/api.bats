@@ -65,13 +65,13 @@ setup() { setup_env; }
   [[ "$stderr" == *"attempt 1/1"* ]]
 }
 
-@test "list commands fetch every page" {
+@test "list commands fetch every page (pages of 50 by default)" {
   mock_seed 250
   octo dns list --domain=example.com --json --quiet
   [ "$status" -eq 0 ]
   assert_json 'length == 250'
-  [ "$(mock_requests | grep -c 'GET /client/v4/zones/zone123/dns_records')" -eq 3 ]
-  mock_log | jq -e '[.[] | select(.path | endswith("dns_records")) | .query.per_page] | all(. == "100")' >/dev/null
+  [ "$(mock_requests | grep -c 'GET /client/v4/zones/zone123/dns_records')" -eq 5 ]
+  mock_log | jq -e '[.[] | select(.path | endswith("dns_records")) | .query.per_page] | all(. == "50")' >/dev/null
 }
 
 @test "--limit fetches a single page" {

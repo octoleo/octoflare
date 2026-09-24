@@ -56,6 +56,10 @@ useColor() {
 
 # _log - Internal logger (always stderr so stdout stays machine-readable)
 #
+# Under GITHUB_ACTIONS=true error/warn/debug lines are also emitted as ::error / ::warning /
+# ::debug workflow commands, on stderr as well, so they survive $(...) captures and never
+# pollute --json / --field output.
+#
 # Arguments:
 #   $1: level (info|success|warn|error|debug)
 #   $2..: message
@@ -299,8 +303,13 @@ resetOpts() {
 #   --key=value      option with value
 #   --key            boolean option (true)
 #   --no-key         boolean option (false)
-#   -e FILE|--env FILE  env file (legacy form with a separate argument)
+#   -e FILE|-e=FILE  env file (sets --env-file)
+#   --env FILE       env file, legacy form with a separate argument (sets --env)
 #   --               end of options, everything after is positional
+#
+# --env=<file> is the legacy env-file option: it is only treated as a file when the command
+# being run does not declare --env in its own usage (see loadEnvFile / commandClaimsOpt);
+# --env-file=<file>, -e <file> and OCTOFLARE_ENV_FILE always name the env file.
 parseArgs() {
   local arg key value
   while [[ $# -gt 0 ]]; do
@@ -323,12 +332,13 @@ parseArgs() {
       -y|--yes) setOpt yes true; PARSED_OPTS+=("--yes") ;;
       -e|--env)
         if [[ -n "${2:-}" ]]; then
-          setOpt env "$2"; PARSED_OPTS+=("--env=$2"); shift
+          key="env"; [[ "$arg" == "-e" ]] && key="env-file"
+          setOpt "$key" "$2"; PARSED_OPTS+=("--${key}=$2"); shift
         else
-          die '"--env" requires a non-empty option argument.' "$EX_ARGS"
+          die "\"${arg}\" requires a non-empty option argument." "$EX_ARGS"
         fi
         ;;
-      -e=*) setOpt env "${arg#*=}"; PARSED_OPTS+=("--env=${arg#*=}") ;;
+      -e=*) setOpt env-file "${arg#*=}"; PARSED_OPTS+=("--env-file=${arg#*=}") ;;
       --json) setOpt output json; PARSED_OPTS+=("--output=json") ;;
       --no-*)
         key="${arg#--no-}"
@@ -374,8 +384,11 @@ applyGlobalOpts() {
 
 # loadEnvLine - Apply one KEY=VALUE line from an env file
 #
-# Existing (exported) environment variables win over the file unless
-# OCTOFLARE_ENV_OVERRIDE=true, so CI secrets are never clobbered by a checked-in file.
+# Only variables that were present in the original process environment (OCTOFLARE_ORIG_ENV)
+# win over the file, unless OCTOFLARE_ENV_OVERRIDE=true, so CI secrets are never clobbered by
+# a checked-in file while OCTOFLARE_* switches defaulted at module load can still be set by it.
+# Values may be "double" or 'single' quoted (with an inline # comment after the closing quote),
+# unquoted values stop at " #"; a trailing CR (CRLF files) is dropped.
 loadEnvLine() {
   local line="$1" key value
   line="${line#"${line%%[![:space:]]*}"}"   # ltrim
@@ -435,15 +448,24 @@ envWasSet() {
   [[ -n "${!1+x}" ]]
 }
 
-# loadEnvFile - Load variables from --env / OCTOFLARE_ENV_FILE, or (interactively) ./.octoflare,
-# ./.env.octoflare and ~/.config/octoflare/.env
+# loadEnvFile - Load variables from --env-file / -e / --env / OCTOFLARE_ENV_FILE, or
+# (interactively) ./.octoflare, ./.env.octoflare and ~/.config/octoflare/.env
 #
 # In unattended runs (CI, GitHub Actions) only an explicitly requested file is loaded: a
 # checked-in ./.octoflare from an untrusted contributor must never be able to redirect
-# requests or change zones silently.
+# requests or change zones silently. --env=<file> (legacy spelling) is only an env file when
+# the command does not declare --env for itself (pages deployments --env=production).
+#
+# Arguments:
+#   $1: resource being run
+#   $2: action being run (may be empty)
 loadEnvFile() {
   local explicit path
-  explicit="$(optFirst "${OCTOFLARE_ENV_FILE:-}" env env-file)"
+  explicit="$(opt env-file)"
+  if [[ -z "$explicit" ]] && hasOpt env && ! commandClaimsOpt "${1:-}" "${2:-}" env; then
+    explicit="$(opt env)"
+  fi
+  [[ -z "$explicit" ]] && explicit="${OCTOFLARE_ENV_FILE:-}"
   if [[ -n "$explicit" ]]; then
     [[ -f "$explicit" ]] || die "Environment file not found: ${explicit}" "$EX_CONFIG"
     path="$explicit"
@@ -466,6 +488,11 @@ loadEnvFile() {
 }
 
 # applyCredentialOpts - Copy credential options/aliases into the canonical CLOUDFLARE_* variables
+#
+# --api-email (not --email, which commands may use for their own payloads) is the global-key
+# e-mail; CLOUDFLARE_API_BASE must be https:// (http:// only for 127.0.0.1/localhost). Only
+# non-empty CLOUDFLARE_* variables are exported so an env file loaded later (per batch line)
+# can still supply the missing ones.
 applyCredentialOpts() {
   hasOpt api-token && CLOUDFLARE_API_TOKEN="$(opt api-token)"
   hasOpt token && CLOUDFLARE_API_TOKEN="$(opt token)"
@@ -503,7 +530,8 @@ applyCredentialOpts() {
   return 0
 }
 
-# requireAuth - Ensure we have credentials for the Cloudflare API
+# requireAuth - Ensure we have credentials for the Cloudflare API: an API token, a global key
+# with --api-email/CLOUDFLARE_EMAIL, or (CF_AUTH_MODE=origin-ca) an Origin CA key
 requireAuth() {
   [[ "${CF_AUTH_MODE:-token}" == "origin-ca" && -n "${CLOUDFLARE_ORIGIN_CA_KEY:-}" ]] && return 0
   if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && [[ -z "${CLOUDFLARE_API_KEY:-}" || -z "${CLOUDFLARE_EMAIL:-}" ]]; then
@@ -541,7 +569,8 @@ ghOutput() {
 
 GH_MASKED=""
 
-# ghMask - Mask a secret in GitHub Actions logs (once per value)
+# ghMask - Mask a secret in GitHub Actions logs (once per process and value; the ::add-mask
+# command is written to stderr so stdout stays clean for --json / --field consumers)
 ghMask() {
   [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${1:-}" ]] || return 0
   case "$GH_MASKED" in
@@ -788,6 +817,21 @@ commandFunction() {
   echo "cmd_${r}_${a}"
 }
 
+# commandClaimsOpt - True when the registered usage of a command declares the option
+# (used to hand --env to "pages deployments" instead of treating it as an env file)
+#
+# Arguments:
+#   $1: resource
+#   $2: action (empty: the resource's default action)
+#   $3: option name (without --)
+commandClaimsOpt() {
+  local resource="$1" action="$2" name="$3"
+  [[ -z "$resource" ]] && return 1
+  [[ -z "$action" ]] && action="$(defaultAction "$resource")"
+  printf '%s' "$COMMAND_REGISTRY" | awk -F'\t' -v r="$resource" -v a="$action" -v o="$name" \
+    '$1==r && $2==a && $3 ~ ("(^|[^A-Za-z0-9_-])--" o "([^A-Za-z0-9_-]|$)") {found=1} END {exit !found}'
+}
+
 #####################################################################################################################VDM
 ######################################## Dispatcher
 
@@ -803,11 +847,10 @@ runCommand() {
   resetOpts
   parseArgs "$@"
   applyGlobalOpts
-  loadEnvFile
-  applyCredentialOpts
-
   resource="$(resourceAlias "$(lower "${ARGS[0]:-}")")"
   action="$(lower "${ARGS[1]:-}")"
+  loadEnvFile "$resource" "$action"
+  applyCredentialOpts
 
   if [[ "$(optBool help)" == "true" || -z "$resource" ]]; then
     if [[ -n "$resource" && "$resource" != "help" ]]; then
@@ -940,18 +983,23 @@ cmd_config_show() {
 }
 
 cmd_self_path() {
-  local json
-  json="$(jq -cn --arg script "${BASH_SOURCE[1]:-$0}" --arg lib "${OCTOFLARE_LIB_DIR:-bundled}" --arg home "$(octoflareHome)" '{script:$script, lib_dir:$lib, home:$home}')"
+  local json home
+  home="$(octoflareHome)" || exit $?
+  json="$(jq -cn --arg script "${BASH_SOURCE[1]:-$0}" --arg lib "${OCTOFLARE_LIB_DIR:-bundled}" --arg home "$home" '{script:$script, lib_dir:$lib, home:$home}')"
   emitResult "$json" 'to_entries[] | "\(.key)=\(.value)"'
 }
 
+# cmd_self_install_deps - Install curl and jq (required) and openssl (optional: only
+# "ssl origin-cert-create" without --csr needs it, so a missing openssl is a warning, not exit 69)
 cmd_self_install_deps() {
   ensureDependency curl curl
   ensureDependency jq jq
-  if ! hasCmd openssl; then
-    OCTOFLARE_YES=true ensureDependency openssl openssl || true
+  if hasCmd openssl || OCTOFLARE_YES=true ensureDependency openssl openssl optional; then
+    emitMessage "All dependencies are installed."
+  else
+    logWarn "openssl is not installed; it is only needed by 'ssl origin-cert-create' without --csr."
+    emitMessage "Required dependencies (curl, jq) are installed; openssl is missing (optional)." '{"openssl":false}'
   fi
-  emitMessage "All dependencies are installed."
 }
 
 # installedScriptPath - Location of the running script (for update / uninstall)
@@ -977,7 +1025,10 @@ cmd_self_update() {
     sudoCmd cp "$tmp" "$script" && sudoCmd chmod +x "$script"
   fi || die "Update failed: could not write ${script}" "$EX_FAILURE"
   rm -f "$tmp"
-  lib_dir="${OCTOFLARE_LIB_DIR:-$(octoflareHome)/lib}"
+  lib_dir="${OCTOFLARE_LIB_DIR:-}"
+  if [[ -z "$lib_dir" ]]; then
+    lib_dir="$(octoflareHome)/lib" || exit $?
+  fi
   if [[ "${OCTOFLARE_BUNDLED:-false}" != "true" ]]; then
     logInfo "Updating modules in ${lib_dir}..."
     for name in $OCTOFLARE_MODULES; do
@@ -987,18 +1038,43 @@ cmd_self_update() {
   emitMessage "${PROGRAM_NAME} updated to the latest ${OCTOFLARE_REF} version at ${script}."
 }
 
+# uninstallHomeIsSafe - True when the data directory may be removed recursively: it must end
+# in /octoflare (a directory Octoflare created) and must not be /, $HOME or a parent of it
+uninstallHomeIsSafe() {
+  local home="$1"
+  [[ -n "$home" && "$home" != "/" && "$home" != */ ]] || return 1
+  [[ "$home" == */"${PROGRAM_CODE}" ]] || return 1
+  if [[ -n "${HOME:-}" ]]; then
+    local h="${HOME%/}"
+    [[ "$home" == "$h" || "$h" == "$home"/* ]] && return 1
+  fi
+  return 0
+}
+
+# cmd_self_uninstall - Remove the script, the modules and the data directory
+#
+# The data directory (OCTOFLARE_HOME) is only removed when uninstallHomeIsSafe accepts it;
+# unattended runs answer the confirmation automatically, so the guard is what protects a
+# mis-set OCTOFLARE_HOME (e.g. $HOME or /) from being wiped.
 cmd_self_uninstall() {
-  local script lib_dir home
+  local script lib_dir home home_note
   script="$(installedScriptPath)"
   lib_dir="${OCTOFLARE_LIB_DIR:-}"
-  home="$(octoflareHome)"
-  confirm "Remove ${script}, ${lib_dir:-no modules} and ${home}?" || die "Uninstall cancelled." "$EX_OK"
+  home="$(octoflareHome)" || exit $?
+  home_note="$home"
+  if ! uninstallHomeIsSafe "$home"; then
+    logWarn "Not removing ${home}: OCTOFLARE_HOME must end in /${PROGRAM_CODE} and cannot be /, \$HOME or a parent of it."
+    home_note="(keeping ${home})"
+  fi
+  confirm "Remove ${script}, ${lib_dir:-no modules} and ${home_note}?" || die "Uninstall cancelled." "$EX_OK"
   if [[ -f "$script" ]]; then
     rm -f "$script" 2>/dev/null || sudoCmd rm -f "$script"
   fi
   if [[ -n "$lib_dir" && -d "$lib_dir" && "$lib_dir" != "/" ]]; then
     rm -rf "$lib_dir" 2>/dev/null || sudoCmd rm -rf "$lib_dir"
   fi
-  [[ -d "$home" ]] && rm -rf "$home"
+  if [[ -d "$home" ]] && uninstallHomeIsSafe "$home"; then
+    rm -rf "$home"
+  fi
   emitMessage "${PROGRAM_NAME} v${PROGRAM_VERSION} uninstalled."
 }

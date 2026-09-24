@@ -43,7 +43,8 @@ cmd_zone_id() {
 
 cmd_zone_create() {
   local name body type
-  name="$(optFirst "" name domain zone)"
+  # only --name: --domain/--zone name an existing zone (resolveAccount would look it up)
+  name="$(opt name)"
   [[ -z "$name" ]] && die "Missing required option --name=<domain>" "$EX_ARGS"
   type="$(opt type full)"
   resolveAccount

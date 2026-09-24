@@ -45,6 +45,7 @@ def fresh_state():
         "rulesets": {"zone123": [], "zone456": []},
         "access_rules": {"zone123": [], "zone456": []},
         "pagerules": {"zone123": [], "zone456": []},
+        "tiered_cache": {"zone123": "off", "zone456": "off"},
         "flaky_hits": 0,
         "ratelimit_hits": 0,
         "counter": 0,
@@ -53,6 +54,28 @@ def fresh_state():
 
 
 STATE = fresh_state()
+
+
+def normalize_txt(rec):
+    """Store TXT content the way the real API does: as RFC 1035 quoted strings."""
+    content = rec.get("content")
+    if rec.get("type") == "TXT" and isinstance(content, str) and content and not content.startswith('"'):
+        rec["content"] = '"%s"' % content.replace("\\", "\\\\").replace('"', '\\"')
+    return rec
+
+
+NUMERIC_SETTINGS = ("browser_cache_ttl", "challenge_ttl", "max_upload", "edge_cache_ttl", "proxy_read_timeout")
+STRING_ENUM_SETTINGS = {"min_tls_version": ("1.0", "1.1", "1.2", "1.3"), "origin_max_http_version": ("1", "2"),
+                        "security_level": ("essentially_off", "low", "medium", "high", "under_attack")}
+
+
+def invalid_setting(name, value):
+    """Return an error message when the value has the wrong JSON type for the setting (like the real API)."""
+    if name in NUMERIC_SETTINGS and (isinstance(value, bool) or not isinstance(value, (int, float))):
+        return "Invalid value for zone setting %s (expected a number)" % name
+    if name in STRING_ENUM_SETTINGS and value not in STRING_ENUM_SETTINGS[name]:
+        return "Invalid value for zone setting %s" % name
+    return None
 
 
 def next_id(prefix):
@@ -215,6 +238,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["rulesets"][zone["id"]] = []
             STATE["access_rules"][zone["id"]] = []
             STATE["pagerules"][zone["id"]] = []
+            STATE["tiered_cache"][zone["id"]] = "off"
             return self.send_json(200, envelope(zone))
 
         m = re.match(r"^/zones/([^/]+)(/.*)?$", api)
@@ -249,6 +273,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(429, envelope(None, success=False, errors=[{"code": 10429, "message": "rate limited"}]), {"Retry-After": "1"})
             return self.send_json(200, envelope({"ok": True, "hits": STATE["ratelimit_hits"]}))
 
+        # -------------------------------------------------------------- smart tiered cache
+        if rest == "/cache/tiered_cache_smart_topology_enable":
+            if method == "PATCH":
+                if body.get("value") not in ("on", "off"):
+                    return self.bad_request("Invalid value for tiered_cache_smart_topology_enable", 1007)
+                STATE["tiered_cache"][zone_id] = body["value"]
+            return self.send_json(200, envelope({"id": "tiered_cache_smart_topology_enable", "value": STATE["tiered_cache"][zone_id], "editable": True}))
+
         # -------------------------------------------------------------- settings
         settings = STATE["settings"][zone_id]
         if rest == "/settings":
@@ -256,6 +288,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, envelope([{"id": k, "value": v, "editable": True} for k, v in settings.items()]))
             if method == "PATCH":
                 out = []
+                for item in body.get("items", []):
+                    msg = invalid_setting(item["id"], item["value"])
+                    if msg:
+                        return self.bad_request(msg, 1007)
                 for item in body.get("items", []):
                     settings[item["id"]] = item["value"]
                     out.append({"id": item["id"], "value": item["value"], "editable": True})
@@ -268,8 +304,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.not_found("Unknown setting")
                 return self.send_json(200, envelope({"id": name, "value": settings[name], "editable": True}))
             if method == "PATCH":
-                if name == "security_level" and body.get("value") not in ("essentially_off", "low", "medium", "high", "under_attack"):
-                    return self.bad_request("Invalid value for zone setting security_level", 1007)
+                msg = invalid_setting(name, body.get("value"))
+                if msg:
+                    return self.bad_request(msg, 1007)
                 settings[name] = body.get("value")
                 return self.send_json(200, envelope({"id": name, "value": settings[name], "editable": True}))
 
@@ -286,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
                 records[:] = [r for r in records if r["id"] != d["id"]]
                 result["deletes"].append({"id": d["id"]})
             for p in body.get("posts", []):
-                rec = self.mk_record(zone_id, p)
+                rec = normalize_txt(self.mk_record(zone_id, p))
                 records.append(rec)
                 result["posts"].append(rec)
             for p in body.get("patches", []):
@@ -313,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.bad_request("DNS record content is required", 9100)
                 if body["type"] in ("A", "AAAA", "CNAME") and any(r["name"] == body["name"] and r["type"] == "CNAME" for r in records):
                     return self.bad_request("A CNAME record with that host already exists", 81053)
-                rec = self.mk_record(zone_id, body)
+                rec = normalize_txt(self.mk_record(zone_id, body))
                 records.append(rec)
                 return self.send_json(200, envelope(rec))
         rm = re.match(r"^/dns_records/([^/]+)$", rest)
@@ -325,6 +362,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, envelope(rec))
             if method in ("PATCH", "PUT"):
                 rec.update({k: v for k, v in body.items() if k != "id"})
+                normalize_txt(rec)
                 rec["modified_on"] = "2025-01-02T00:00:00Z"
                 return self.send_json(200, envelope(rec))
             if method == "DELETE":

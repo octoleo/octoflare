@@ -27,7 +27,7 @@ registerCommand lockdown create "--domain=<zone> --urls=<a,b> --ips=<ip|cidr,...
 registerCommand lockdown delete "--domain=<zone> --id=<rule-id>" "Delete a Zone Lockdown rule"
 registerCommand bot status "--domain=<zone>" "Show Bot Fight Mode / bot management configuration"
 registerCommand bot fight-mode "--domain=<zone> on|off" "Turn Bot Fight Mode on or off"
-registerCommand bot ai-bots "--domain=<zone> block|disabled|only_on_ad_pages" "Block AI crawlers (AI bots protection)"
+registerCommand bot ai-bots "--domain=<zone> block|disabled|only_on_ad_pages (or on|off)" "Block AI crawlers (AI bots protection); on = block, off = disabled"
 registerCommand bot set "--domain=<zone> --settings='{\"fight_mode\":true,...}'" "Update any bot management field"
 
 ACCESS_RULE_TEMPLATE='.[] | "\(.mode)\t\(.configuration.target)=\(.configuration.value)\tid=\(.id)\tscope=\(.scope.type // "-")\tnotes=\(.notes // "-")"'
@@ -95,6 +95,19 @@ accessRulePath() {
   fi
 }
 
+# accessRuleMatch - The first listed rule that belongs to the requested scope (prints JSON or nothing)
+#
+# The zone listing also returns account-wide rules (scope.type "organization"/"user"), which
+# must never be updated or deleted through the zone path; only rules with scope.type "zone"
+# count as the zone's own rule. The account listing holds account rules only.
+accessRuleMatch() {
+  if [[ "$(opt scope)" == "account" ]]; then
+    cfResult '.result[0] // empty'
+  else
+    cfResult '[.result[]? | select(.scope.type == "zone")][0] // empty'
+  fi
+}
+
 # accessRuleValue - Normalise the value (uppercase ASN/country)
 accessRuleValue() {
   local v="$1" target="$2"
@@ -136,7 +149,7 @@ cmd_access_rule_create() {
 
 cmd_access_rule_upsert() {
   requireOpt mode
-  local value target path id existing_mode body
+  local value target path id existing existing_mode body
   value="$(optFirst "" value ip)"
   [[ -z "$value" ]] && die "Missing required option --value=<ip|cidr|ASnnn|country>" "$EX_ARGS"
   target="$(accessRuleTarget "$value")"
@@ -144,15 +157,16 @@ cmd_access_rule_upsert() {
   accessRulePath
   path="$AR_PATH"
   cfApiList "$path" "$(cfQuery "configuration.value=${value}" "configuration.target=${target}")"
-  id="$(cfResultRaw '.result[0].id // empty')"
-  existing_mode="$(cfResultRaw '.result[0].mode // empty')"
+  existing="$(accessRuleMatch)"
+  id="$(printf '%s' "$existing" | jq -r '.id // empty')"
+  existing_mode="$(printf '%s' "$existing" | jq -r '.mode // empty')"
   if [[ -z "$id" ]]; then
     accessRuleCreate "$(opt mode)" "$value"
     return 0
   fi
-  if [[ "$existing_mode" == "$(opt mode)" && ( -z "$(opt notes)" || "$(opt notes)" == "$(cfResultRaw '.result[0].notes // ""')" ) ]]; then
+  if [[ "$existing_mode" == "$(opt mode)" && ( -z "$(opt notes)" || "$(opt notes)" == "$(printf '%s' "$existing" | jq -r '.notes // ""')" ) ]]; then
     logInfo "Access rule for ${value} is already ${existing_mode}."
-    emitResult "$(cfResult '.result[0] + {action:"unchanged"}')" "$ACCESS_RULE_ONE"
+    emitResult "$(printf '%s' "$existing" | jq -c '. + {action:"unchanged"}')" "$ACCESS_RULE_ONE"
     return 0
   fi
   body="$(jq -cn --arg m "$(opt mode)" --arg n "$(opt notes)" '{mode:$m} + (if $n != "" then {notes:$n} else {} end)')"
@@ -176,7 +190,7 @@ cmd_access_rule_delete() {
     target="$(accessRuleTarget "$value")"
     value="$(accessRuleValue "$value" "$target")"
     cfApiList "$path" "$(cfQuery "configuration.value=${value}" "configuration.target=${target}")"
-    id="$(cfResultRaw '.result[0].id // empty')"
+    id="$(accessRuleMatch | jq -r '.id // empty')"
     if [[ -z "$id" ]]; then
       [[ "$OCTOFLARE_DRY_RUN" == "true" ]] && id="dry-run-rule-id"
       [[ -z "$id" && "$(optBool if-exists)" == "true" ]] && { emitMessage "No access rule for ${value}; nothing to delete."; return 0; }
@@ -282,7 +296,8 @@ cmd_bot_fight_mode() {
   value="$(opt value)"
   [[ -z "$value" && -n "${ARGS[2]:-}" ]] && value="${ARGS[2]}"
   [[ -z "$value" ]] && die "Usage: bot fight-mode on|off" "$EX_ARGS"
-  botUpdate "$(jq -cn --argjson v "$(normalizeBool "$value")" '{fight_mode:$v}')"
+  value="$(parseBool "$value")" || exit $?
+  botUpdate "$(jq -cn --argjson v "$value" '{fight_mode:$v}')"
 }
 
 cmd_bot_ai_bots() {
@@ -290,11 +305,19 @@ cmd_bot_ai_bots() {
   value="$(opt value)"
   [[ -z "$value" && -n "${ARGS[2]:-}" ]] && value="${ARGS[2]}"
   [[ -z "$value" ]] && die "Usage: bot ai-bots block|disabled|only_on_ad_pages" "$EX_ARGS"
-  case "$(normalizeBool "$value")" in
-    true) [[ "$value" != "only_on_ad_pages" ]] && value=block ;;
-    false) [[ "$value" != "only_on_ad_pages" ]] && value=disabled ;;
-  esac
+  value="$(botAiBotsValue "$value")" || exit $?
   botUpdate "$(jq -cn --arg v "$value" '{ai_bots_protection:$v}')"
+}
+
+# botAiBotsValue - Normalise the ai_bots_protection value: block|disabled|only_on_ad_pages, or a boolean word (on -> block, off -> disabled)
+botAiBotsValue() {
+  local value
+  value="$(lower "$1")"
+  case "$value" in
+    block|disabled|only_on_ad_pages) printf '%s' "$value"; return 0 ;;
+  esac
+  value="$(parseBool "$value" 2>/dev/null)" || die "Invalid value \"$1\" for bot ai-bots (expected block, disabled, only_on_ad_pages or on|off)" "$EX_ARGS"
+  if [[ "$value" == "true" ]]; then printf 'block'; else printf 'disabled'; fi
 }
 
 cmd_bot_set() {

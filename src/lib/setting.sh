@@ -40,15 +40,24 @@ settingGet() {
   cfApi GET "/zones/${CF_ZONE_ID}/settings/$1"
 }
 
-# settingSet - PATCH one setting (value is converted to a typed JSON value)
+# settingSet - PATCH one setting (value is converted to the JSON type the API expects)
+#
+# Only the settings the API types as numbers are sent as JSON numbers; every other
+# scalar is sent as a string (min_tls_version "1.2", origin_max_http_version "2",
+# on/off, named levels). Values given as JSON objects, arrays or booleans keep their type.
 settingSet() {
   local name="$1" value="$2" json
   resolveZone
   case "$name" in
-    security_header|nel|ciphers|automatic_platform_optimization) json="$(toJsonValue "$value")" ;;
+    browser_cache_ttl|challenge_ttl|max_upload|edge_cache_ttl|proxy_read_timeout)
+      [[ "$value" =~ ^-?[0-9]+$ ]] || die "Setting ${name} expects a whole number (got \"${value}\")" "$EX_ARGS"
+      json="$value"
+      ;;
     *)
-      # on/off and named levels stay strings; numbers become numbers (browser_cache_ttl, challenge_ttl, ...)
-      if [[ "$value" =~ ^-?[0-9]+$ ]]; then json="$value"; else json="$(toJsonValue "$value")"; fi
+      case "$value" in
+        \{*|\[*|true|false) json="$(toJsonValue "$value")" ;;
+        *) json="$(jq -cn --arg v "$value" '$v')" ;;
+      esac
       ;;
   esac
   cfApi PATCH "/zones/${CF_ZONE_ID}/settings/${name}" "$(jq -cn --argjson v "$json" '{value:$v}')"

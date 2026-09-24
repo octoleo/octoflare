@@ -7,6 +7,7 @@
 #   OCTOFLARE_REF      Branch or tag to install (default: master)
 #   OCTOFLARE_PREFIX   Install prefix (default: /usr/local when writable or sudo is available, else ~/.local)
 #   OCTOFLARE_NO_DEPS  Set to true to skip installing curl/jq
+#   OCTOFLARE_TIMEOUT  Per-download time limit in seconds (default: 60)
 #
 # @copyright  Copyright (C) 2025 Llewellyn van der Merwe. All rights reserved.
 # @license    GNU General Public License version 2; see LICENSE
@@ -21,9 +22,10 @@ PROGRAM="octoflare"
 log() { printf '[install] %s\n' "$*" >&2; }
 hasCmd() { command -v "$1" >/dev/null 2>&1; }
 
+# download URL FILE - bounded in time so a silent proxy cannot hang an unattended install
 download() {
-  if hasCmd curl; then curl -fsSL --retry 3 -o "$2" "$1"
-  elif hasCmd wget; then wget -q -O "$2" "$1"
+  if hasCmd curl; then curl -fsSL --retry 3 --connect-timeout 15 --max-time "${OCTOFLARE_TIMEOUT:-60}" -o "$2" "$1"
+  elif hasCmd wget; then wget -q --timeout=15 --tries=3 -O "$2" "$1"
   else log "curl or wget is required to download Octoflare"; exit 1
   fi
 }
@@ -42,8 +44,11 @@ if [ -n "${OCTOFLARE_PREFIX:-}" ]; then
   PREFIX="$OCTOFLARE_PREFIX"
 elif [ -w /usr/local/bin ] || asRoot true 2>/dev/null; then
   PREFIX="/usr/local"
-else
+elif [ -n "${HOME:-}" ]; then
   PREFIX="${HOME}/.local"
+else
+  log "Cannot pick an install prefix: /usr/local is not writable, sudo is unavailable and HOME is unset. Set OCTOFLARE_PREFIX."
+  exit 1
 fi
 BIN_DIR="${PREFIX}/bin"
 LIB_DIR="${PREFIX}/lib/${PROGRAM}"
@@ -82,7 +87,7 @@ log "Installed ${BIN_DIR}/${PROGRAM} with modules in ${LIB_DIR}"
 
 # Dependencies (curl, jq)
 if [ "${OCTOFLARE_NO_DEPS:-false}" != "true" ]; then
-  OCTOFLARE_UNATTENDED=true OCTOFLARE_LIB_DIR="$LIB_DIR" "${BIN_DIR}/${PROGRAM}" self install-deps --quiet || log "Could not install dependencies automatically; install curl and jq manually."
+  OCTOFLARE_UNATTENDED=true OCTOFLARE_LIB_DIR="$LIB_DIR" "${BIN_DIR}/${PROGRAM}" self install-deps --quiet || log "Could not install dependencies automatically; install curl and jq with your package manager."
 fi
 
 case ":${PATH}:" in

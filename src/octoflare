@@ -35,12 +35,22 @@ export PROGRAM_NAME PROGRAM_CODE PROGRAM_VERSION PROGRAM_V PROGRAM_REPO PROGRAM_
 ######################################## Bootstrap helpers (available before the modules are loaded)
 
 # bootLog - Minimal logger used until core.sh is loaded (always to stderr)
+#
+# Under GITHUB_ACTIONS=true errors and warnings are also written as ::error / ::warning
+# workflow commands (to stderr as well, so stdout stays clean for --json consumers), so a
+# bootstrap failure (dependency or module install) is annotated like a core.sh error.
 bootLog() {
   local level="$1"; shift
   if [[ "${OCTOFLARE_QUIET:-false}" == "true" && "$level" != "error" ]]; then
     return 0
   fi
   printf '[%s] %s\n' "$level" "$*" >&2
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    case "$level" in
+      error) printf '::error title=%s::%s\n' "$PROGRAM_NAME" "$*" >&2 ;;
+      warn) printf '::warning title=%s::%s\n' "$PROGRAM_NAME" "$*" >&2 ;;
+    esac
+  fi
 }
 
 # hasCmd - Check whether a command exists on the PATH
@@ -89,19 +99,23 @@ detectUnattended() {
 
 # download - Fetch a URL to a file using whatever downloader is available
 #
+# Every downloader is bounded in time (connect 15s, whole transfer OCTOFLARE_TIMEOUT,
+# default 60s) so an unattended run fails instead of hanging on a silent proxy.
+#
 # Arguments:
 #   $1: URL
 #   $2: Destination file
 download() {
-  local url="$1" dest="$2"
+  local url="$1" dest="$2" max_time="${OCTOFLARE_TIMEOUT:-60}"
   if hasCmd curl; then
-    curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url"
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url"
   elif hasCmd wget; then
-    wget -q -O "$dest" "$url"
+    wget -q --timeout=15 --tries=3 -O "$dest" "$url"
   elif hasCmd python3; then
-    python3 - "$url" "$dest" <<'PY'
+    python3 - "$url" "$dest" "$max_time" <<'PY'
 import sys, urllib.request
-urllib.request.urlretrieve(sys.argv[1], sys.argv[2])
+with urllib.request.urlopen(sys.argv[1], timeout=float(sys.argv[3])) as r, open(sys.argv[2], 'wb') as f:
+    f.write(r.read())
 PY
   else
     bootLog error "No downloader available (curl, wget or python3 required) to fetch ${url}"
@@ -160,58 +174,131 @@ installPackage() {
 }
 
 # octoflareHome - The per-user data directory used for downloaded modules and binaries
+#
+# OCTOFLARE_HOME, else $XDG_DATA_HOME/octoflare, else $HOME/.local/share/octoflare. There is
+# deliberately no /tmp fallback: binaries and modules under a world-writable path could be
+# planted by any local user, so when none of the three variables is set this exits 69.
+# Always call it as home="$(octoflareHome)" || exit $?
 octoflareHome() {
-  echo "${OCTOFLARE_HOME:-${XDG_DATA_HOME:-${HOME:-/tmp}/.local/share}/${PROGRAM_CODE}}"
+  if [[ -n "${OCTOFLARE_HOME:-}" ]]; then
+    echo "${OCTOFLARE_HOME%/}"
+  elif [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    echo "${XDG_DATA_HOME%/}/${PROGRAM_CODE}"
+  elif [[ -n "${HOME:-}" ]]; then
+    echo "${HOME%/}/.local/share/${PROGRAM_CODE}"
+  else
+    bootLog error "Cannot determine the ${PROGRAM_NAME} data directory: HOME, XDG_DATA_HOME and OCTOFLARE_HOME are all unset (set OCTOFLARE_HOME; /tmp is not used because it is world-writable)."
+    exit 69
+  fi
 }
 
-# installStaticBinary - Download a static binary as a last resort (no root needed)
+# dirIsPrivate - True when the directory exists, is owned by the current user and is
+# neither group- nor world-writable (safe to put on PATH or to source modules from)
+#
+# The mode bits are read with ls -ld (portable between GNU and BSD); on a system
+# without ls only the ownership check applies.
+dirIsPrivate() {
+  local dir="$1" mode
+  [[ -d "$dir" && -O "$dir" ]] || return 1
+  hasCmd ls || return 0
+  mode="$(ls -ld "$dir" 2>/dev/null)" || return 1
+  [[ "${mode:5:1}" != "w" && "${mode:8:1}" != "w" ]]
+}
+
+# sha256File - Print the SHA-256 digest of a file (sha256sum on Linux, shasum on macOS/BSD)
+#
+# Returns 1 when no hashing tool is available.
+sha256File() {
+  if hasCmd sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  elif hasCmd shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif hasCmd openssl; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else
+    return 1
+  fi
+}
+
+# Pinned static jq release and the official SHA-256 checksums
+# (https://github.com/jqlang/jq/releases/download/jq-1.7.1/sha256sum.txt).
+OCTOFLARE_JQ_VERSION="1.7.1"
+OCTOFLARE_JQ_BASE="https://github.com/jqlang/jq/releases/download/jq-${OCTOFLARE_JQ_VERSION}"
+
+# jqStaticAsset - Print "<asset name> <sha256>" for the pinned jq build of a platform
 #
 # Arguments:
-#   $1: command name (jq|curl)
-installStaticBinary() {
-  local name="$1" arch os url bin_dir target
-  arch="$(uname -m)"
-  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  bin_dir="$(octoflareHome)/bin"
-  mkdir -p "$bin_dir" || return 1
-  target="${bin_dir}/${name}"
-  case "$name" in
-    jq)
-      case "${os}-${arch}" in
-        linux-x86_64) url="https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64" ;;
-        linux-aarch64|linux-arm64) url="https://github.com/jqlang/jq/releases/latest/download/jq-linux-arm64" ;;
-        linux-i386|linux-i686) url="https://github.com/jqlang/jq/releases/latest/download/jq-linux-i386" ;;
-        darwin-x86_64) url="https://github.com/jqlang/jq/releases/latest/download/jq-macos-amd64" ;;
-        darwin-arm64) url="https://github.com/jqlang/jq/releases/latest/download/jq-macos-arm64" ;;
-        *) bootLog error "No static jq build known for ${os}-${arch}"; return 1 ;;
-      esac
-      ;;
-    curl)
-      case "${os}-${arch}" in
-        linux-x86_64) url="https://github.com/moparisthebest/static-curl/releases/latest/download/curl-amd64" ;;
-        linux-aarch64|linux-arm64) url="https://github.com/moparisthebest/static-curl/releases/latest/download/curl-aarch64" ;;
-        *) bootLog error "No static curl build known for ${os}-${arch}"; return 1 ;;
-      esac
-      ;;
+#   $1: "<os>-<arch>" as reported by uname (lowercase os)
+jqStaticAsset() {
+  case "$1" in
+    linux-x86_64) echo "jq-linux-amd64 5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5" ;;
+    linux-aarch64|linux-arm64) echo "jq-linux-arm64 4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5" ;;
+    linux-i386|linux-i686) echo "jq-linux-i386 bc473fd4b385789e9ce3d02a4c8df74dc988a34b20fe4e1a80da997eb360b599" ;;
+    darwin-x86_64) echo "jq-macos-amd64 4155822bbf5ea90f5c79cf254665975eb4274d426d0709770c21774de5407443" ;;
+    darwin-arm64) echo "jq-macos-arm64 0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a" ;;
     *) return 1 ;;
   esac
-  bootLog info "Downloading static ${name} binary to ${target}..."
-  download "$url" "$target" || return 1
-  chmod +x "$target" || return 1
+}
+
+# installStaticBinary - Download a pinned, checksum-verified static binary as a last resort
+# (no root needed). Only jq is supported: curl must come from the package manager, a
+# third-party static curl would handle the API token and cannot be verified upstream.
+#
+# The download is verified against the embedded SHA-256 before it is made executable;
+# a mismatch (or no sha256sum/shasum/openssl to verify with) fails closed.
+#
+# Arguments:
+#   $1: command name (jq)
+installStaticBinary() {
+  local name="$1" platform asset url expected actual bin_dir target tmp
+  platform="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+  case "$name" in
+    jq)
+      asset="$(jqStaticAsset "$platform")" || { bootLog error "No static jq ${OCTOFLARE_JQ_VERSION} build known for ${platform}"; return 1; }
+      expected="${asset#* }"
+      url="${OCTOFLARE_JQ_BASE}/${asset%% *}"
+      ;;
+    curl) bootLog error "curl is only installed from the package manager (no static curl download)."; return 1 ;;
+    *) return 1 ;;
+  esac
+  bin_dir="$(octoflareHome)/bin" || exit $?
+  mkdir -p "$bin_dir" || return 1
+  chmod go-w "$bin_dir" 2>/dev/null || true
+  target="${bin_dir}/${name}"
+  tmp="${target}.download.$$"
+  bootLog info "Downloading ${name} ${OCTOFLARE_JQ_VERSION} (static binary) to ${target}..."
+  download "$url" "$tmp" || { rm -f "$tmp"; return 1; }
+  actual="$(sha256File "$tmp")" || { rm -f "$tmp"; bootLog error "Cannot verify ${name}: no sha256sum, shasum or openssl available."; return 1; }
+  if [[ "$actual" != "$expected" ]]; then
+    rm -f "$tmp"
+    bootLog error "Checksum mismatch for ${url}: expected ${expected}, got ${actual}. Refusing to install."
+    return 1
+  fi
+  { chmod +x "$tmp" && mv -f "$tmp" "$target"; } || { rm -f "$tmp"; return 1; }
   export PATH="${bin_dir}:${PATH}"
   hasCmd "$name"
 }
 
-# ensureDependency - Make sure a required command exists, installing it when allowed
+# ensureDependency - Make sure a command exists, installing it when allowed
+#
+# The per-user bin directory ($OCTOFLARE_HOME/bin) is added to PATH only when it is owned
+# by the current user and not group/world writable. Required dependencies exit 69 when they
+# cannot be provided; with mode "optional" the function returns 1 instead (warnings only).
 #
 # Arguments:
 #   $1: command name
 #   $2: package name (defaults to the command name)
+#   $3: "optional" to return 1 instead of exiting when the command cannot be installed
 ensureDependency() {
-  local cmd="$1" pkg="${2:-$1}" answer=""
-  local bin_dir
-  bin_dir="$(octoflareHome)/bin"
-  [[ -d "$bin_dir" ]] && export PATH="${bin_dir}:${PATH}"
+  local cmd="$1" pkg="${2:-$1}" mode="${3:-required}" answer="" home bin_dir
+  if ! hasCmd "$cmd" && home="$(octoflareHome 2>/dev/null)"; then
+    bin_dir="${home}/bin"
+    if dirIsPrivate "$bin_dir"; then
+      export PATH="${bin_dir}:${PATH}"
+    elif [[ -d "$bin_dir" ]]; then
+      bootLog warn "Ignoring ${bin_dir}: it is not owned by you or is group/world writable."
+    fi
+  fi
   hasCmd "$cmd" && return 0
 
   if ! isUnattended && [[ "${OCTOFLARE_YES:-false}" != "true" ]]; then
@@ -219,11 +306,11 @@ ensureDependency() {
       printf '[prompt] %s requires "%s" which is not installed. Install it now? [Y/n] ' "$PROGRAM_NAME" "$cmd" >&2
       read -r answer
       case "$answer" in
-        n|N|no|NO|No) bootLog error "Cannot continue without ${cmd}. Install it and try again."; exit 69 ;;
+        n|N|no|NO|No) dependencyMissing "$mode" "Cannot continue without ${cmd}. Install it and try again."; return $? ;;
       esac
     else
-      bootLog error "Missing dependency \"${cmd}\". Re-run with --unattended (or --yes) to install it automatically."
-      exit 69
+      dependencyMissing "$mode" "Missing dependency \"${cmd}\". Re-run with --unattended (or --yes) to install it automatically."
+      return $?
     fi
   fi
 
@@ -232,10 +319,27 @@ ensureDependency() {
     return 0
   fi
   if installStaticBinary "$cmd"; then
-    bootLog success "Installed ${cmd} (static binary in $(octoflareHome)/bin)."
+    bootLog success "Installed ${cmd} (static binary in ${bin_dir})."
     return 0
   fi
-  bootLog error "Unable to install \"${cmd}\" automatically. Install it manually and try again."
+  if [[ "$cmd" == "curl" ]]; then
+    dependencyMissing "$mode" "Unable to install curl automatically; install it with your package manager and try again."
+  else
+    dependencyMissing "$mode" "Unable to install \"${cmd}\" automatically. Install it manually and try again."
+  fi
+}
+
+# dependencyMissing - Report a dependency that could not be provided
+#
+# Arguments:
+#   $1: mode (required -> log an error and exit 69; optional -> warn and return 1)
+#   $2: message
+dependencyMissing() {
+  if [[ "$1" == "optional" ]]; then
+    bootLog warn "$2"
+    return 1
+  fi
+  bootLog error "$2"
   exit 69
 }
 
@@ -246,10 +350,21 @@ ensureDependency() {
 #   2. <script dir>/lib           (repository checkout, GitHub Action path)
 #   3. <script dir>/../lib/octoflare  (e.g. /usr/local/bin -> /usr/local/lib/octoflare)
 #   4. $OCTOFLARE_HOME/lib        (per-user auto-install location)
+#
+# The per-user location is only used when it is owned by the current user and not
+# group/world writable (modules found there are sourced). Exits 69 when nothing is
+# installed and no safe per-user directory can be determined (see octoflareHome).
 resolveLibDir() {
-  local sdir candidate
+  local sdir candidate home="" home_lib=""
   sdir="$(scriptDir)"
-  local candidates=("${OCTOFLARE_LIB_DIR:-}" "${sdir}/lib" "${sdir}/../lib/${PROGRAM_CODE}" "$(octoflareHome)/lib")
+  if home="$(octoflareHome 2>/dev/null)"; then
+    home_lib="${home}/lib"
+    if [[ -d "$home_lib" ]] && ! dirIsPrivate "$home_lib"; then
+      bootLog warn "Ignoring modules in ${home_lib}: the directory is not owned by you or is group/world writable."
+      home_lib=""
+    fi
+  fi
+  local candidates=("${OCTOFLARE_LIB_DIR:-}" "${sdir}/lib" "${sdir}/../lib/${PROGRAM_CODE}" "$home_lib")
   for candidate in "${candidates[@]}"; do
     [[ -n "$candidate" && -f "${candidate}/core.sh" ]] && { echo "$candidate"; return 0; }
   done
@@ -257,11 +372,15 @@ resolveLibDir() {
   for candidate in "${candidates[@]}"; do
     [[ -z "$candidate" ]] && continue
     if mkdir -p "$candidate" 2>/dev/null && [[ -w "$candidate" ]]; then
+      [[ "$candidate" == "$home_lib" ]] && chmod go-w "$candidate" 2>/dev/null
       echo "$candidate"
       return 0
     fi
   done
-  echo "$(octoflareHome)/lib"
+  [[ -n "$home_lib" ]] && { echo "$home_lib"; return 0; }
+  home="$(octoflareHome)" || exit $?
+  bootLog error "No safe directory for the ${PROGRAM_NAME} modules: fix the permissions of ${home}/lib or set OCTOFLARE_LIB_DIR."
+  exit 69
 }
 
 # fetchModule - Download a single module into the lib directory
@@ -273,7 +392,8 @@ fetchModule() {
   if [[ -w "$dir" ]]; then
     download "$url" "$tmp" && mv "$tmp" "${dir}/${name}.sh"
   else
-    tmp="$(mktemp 2>/dev/null || echo "/tmp/octoflare.${name}.$$")"
+    # no predictable /tmp names: mktemp is required for the privileged copy
+    tmp="$(mktemp "${TMPDIR:-/tmp}/octoflare.XXXXXX")" || return 1
     download "$url" "$tmp" && sudoCmd mv "$tmp" "${dir}/${name}.sh"
   fi
 }
@@ -317,7 +437,7 @@ ensureDependency curl curl
 ensureDependency jq jq
 
 if [[ "${OCTOFLARE_BUNDLED:-false}" != "true" ]]; then
-  OCTOFLARE_LIB_DIR="$(resolveLibDir)"
+  OCTOFLARE_LIB_DIR="$(resolveLibDir)" || exit $?
   export OCTOFLARE_LIB_DIR
   ensureModules "$OCTOFLARE_LIB_DIR"
 fi

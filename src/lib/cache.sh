@@ -7,7 +7,7 @@
 # @copyright  Copyright (C) 2025 Llewellyn van der Merwe. All rights reserved.
 # @license    GNU General Public License version 2; see LICENSE
 
-registerCommand cache purge "--domain=<zone> (--everything | --urls=a,b | --hosts=a,b | --tags=a,b | --prefixes=a,b)" "Purge cached content"
+registerCommand cache purge "--domain=<zone> (--everything | --urls=a,b | --urls=@file | --hosts=a,b | --tags=a,b | --prefixes=a,b)" "Purge cached content (inline --urls are comma separated; @file or - reads one URL per line)"
 registerCommand cache status "--domain=<zone>" "Show cache related settings"
 registerCommand cache level "--domain=<zone> [--value=aggressive|basic|simplified]" "Get or set the cache level"
 registerCommand cache browser-ttl "--domain=<zone> [--value=<seconds>]" "Get or set the browser cache TTL"
@@ -15,7 +15,7 @@ registerCommand cache tiered "--domain=<zone> [on|off]" "Get or set Smart Tiered
 
 cmd_cache_purge() {
   resolveZone
-  local body="" urls hosts tags prefixes
+  local body="" urls hosts tags prefixes files
   urls="$(optFirst "" urls files url file)"
   hosts="$(optFirst "" hosts host)"
   tags="$(optFirst "" tags tag)"
@@ -23,7 +23,14 @@ cmd_cache_purge() {
   if [[ "$(optBool everything)" == "true" || "$(optBool all)" == "true" ]]; then
     body='{"purge_everything":true}'
   elif [[ -n "$urls" ]]; then
-    body="$(jq -cn --argjson f "$(toJsonArray "$(readFileOrValue "$urls" | tr '\n' ',')")" '{files:$f}')"
+    # inline values are comma separated; @file and - (stdin) hold one URL per line, so a
+    # comma inside such a URL (e.g. in its query string) is kept
+    case "$urls" in
+      @*|-) files="$(readFileOrValue "$urls" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | jq -R . | jq -cs .)" ;;
+      *) files="$(toJsonArray "$urls")" ;;
+    esac
+    [[ "$files" == "[]" ]] && die "No URLs to purge were found in ${urls}" "$EX_ARGS"
+    body="$(jq -cn --argjson f "$files" '{files:$f}')"
   elif [[ -n "$hosts" ]]; then
     body="$(jq -cn --argjson h "$(toJsonArray "$hosts")" '{hosts:$h}')"
   elif [[ -n "$tags" ]]; then
@@ -71,7 +78,8 @@ cmd_cache_tiered() {
   value="$(opt value)"
   [[ -z "$value" && -n "${ARGS[2]:-}" ]] && value="${ARGS[2]}"
   if [[ -n "$value" ]]; then
-    case "$(normalizeBool "$value")" in
+    value="$(parseBool "$value")" || exit $?
+    case "$value" in
       true) value=on ;;
       *) value=off ;;
     esac

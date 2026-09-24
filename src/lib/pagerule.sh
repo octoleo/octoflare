@@ -11,7 +11,7 @@
 registerCommand pagerule list "--domain=<zone> [--status=active|disabled]" "List Page Rules"
 registerCommand pagerule get "--domain=<zone> (--id=<rule-id> | --url=<pattern>)" "Show one Page Rule"
 registerCommand pagerule create "--domain=<zone> --url=<pattern> (--forward-to=<url> [--status-code=301] | --cache-level=<v> | --always-use-https | --ssl=<v> | --edge-cache-ttl=<s> | --browser-cache-ttl=<s> | --actions=<json> ...) [--priority=<n>] [--status=active|disabled]" "Create a Page Rule"
-registerCommand pagerule upsert "--domain=<zone> --url=<pattern> [actions...]" "Create or replace the Page Rule for the URL pattern"
+registerCommand pagerule upsert "--domain=<zone> --url=<pattern> [actions...] [--priority=<n>] [--status=active|disabled]" "Create or replace the Page Rule for the URL pattern (keeps the existing priority/status unless given)"
 registerCommand pagerule update "--domain=<zone> --id=<rule-id> [--url=<pattern>] [actions...] [--priority=<n>] [--status=<v>]" "Update a Page Rule"
 registerCommand pagerule delete "--domain=<zone> (--id=<rule-id> | --url=<pattern>)" "Delete a Page Rule"
 registerCommand pagerule enable "--domain=<zone> (--id=<rule-id> | --url=<pattern>)" "Enable a Page Rule"
@@ -52,23 +52,30 @@ pageruleActions() {
   printf '%s' "$actions"
 }
 
-# pageruleBody - Full page rule body
+# pageruleBody - Full page rule body (status and priority only when --status/--priority were given)
 pageruleBody() {
-  local url actions
+  local url actions body
   url="$(optFirst "" url pattern target)"
   [[ -z "$url" ]] && die "Missing --url=<pattern> (e.g. --url='*example.com/old/*')" "$EX_ARGS"
   actions="$(pageruleActions)"
   [[ "$(printf '%s' "$actions" | jq 'length')" == "0" ]] && die "Provide at least one action (e.g. --forward-to=<url>, --cache-level=cache_everything, --always-use-https or --actions=<json>)" "$EX_ARGS"
-  jq -cn --arg u "$url" --argjson a "$actions" --arg s "$(opt status active)" --argjson p "$(opt priority 1)" '{targets:[{target:"url", constraint:{operator:"matches", value:$u}}], actions:$a, status:$s, priority:$p}'
+  body="$(jq -cn --arg u "$url" --argjson a "$actions" '{targets:[{target:"url", constraint:{operator:"matches", value:$u}}], actions:$a}')"
+  hasOpt status && body="$(jq -cn --argjson b "$body" --arg s "$(opt status)" '$b + {status:$s}')"
+  hasOpt priority && body="$(jq -cn --argjson b "$body" --argjson p "$(opt priority)" '$b + {priority:$p}')"
+  printf '%s' "$body"
 }
 
-# pageruleFind - Find a page rule by --id or --url (prints JSON or nothing)
+# pageruleFind - Find a page rule by --id or --url (prints JSON or nothing; a missing --id prints nothing)
 pageruleFind() {
   local url
   if hasOpt id; then
-    cfApi GET "/zones/${CF_ZONE_ID}/pagerules/$(opt id)"
-    cfResult
-    return 0
+    if cfApiTry GET "/zones/${CF_ZONE_ID}/pagerules/$(opt id)"; then
+      cfResult
+      return 0
+    fi
+    [[ "$CF_HTTP_CODE" == "404" ]] && return 0
+    cfReportError
+    exit "$EX_FAILURE"
   fi
   url="$(optFirst "" url pattern target)"
   [[ -z "$url" ]] && die "Specify --id=<rule-id> or --url=<pattern>" "$EX_ARGS"
@@ -121,6 +128,9 @@ cmd_pagerule_upsert() {
     return 0
   fi
   id="$(printf '%s' "$existing" | jq -r '.id')"
+  # Keep the existing status/priority unless --status/--priority were given, so an upsert
+  # never resets the rule's position or re-enables it as a side effect.
+  body="$(jq -cn --argjson e "$existing" --argjson b "$body" '{status:$e.status, priority:$e.priority} + $b | with_entries(select(.value != null))')"
   if [[ "$(printf '%s' "$existing" | jq -cS '{actions, status, priority, target:.targets[0].constraint.value}')" == "$(printf '%s' "$body" | jq -cS '{actions, status, priority, target:.targets[0].constraint.value}')" ]]; then
     logInfo "Page Rule ${id} is already up to date."
     emitResult "$(printf '%s' "$existing" | jq -c '. + {action_result:"unchanged"}')" "$PAGERULE_ONE"

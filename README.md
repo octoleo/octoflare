@@ -31,8 +31,10 @@ Linted by [#ShellCheck](https://github.com/koalaman/shellcheck), tested with
   it is missing - `curl`, `jq`, and its own modules - instead of failing.
 * **Zone auto-detection**: `dns upsert --name=app.example.com ...` finds the zone from the record
   name; `--zone-id` skips lookups entirely.
-* **Safe transport**: retries with back-off on 429/5xx (honouring `Retry-After`), automatic
-  pagination, clear error messages with Cloudflare error codes, `--dry-run` to preview requests.
+* **Safe transport**: retries with back-off on 429 and, for idempotent requests, on 5xx and
+  network errors (honouring `Retry-After`; a POST is never replayed after a 5xx), automatic
+  pagination, credentials and bodies passed to curl through private files rather than the
+  command line, clear error messages with Cloudflare error codes, `--dry-run` to preview requests.
 * **v1 compatible**: `--enable-attack-mode`, `--disable-attack-mode`, `--status-attack-mode`,
   `--domain=`, `--env`, `--update`, `--uninstall` and `--quiet` still work.
 
@@ -100,18 +102,22 @@ Every command accepts `--json` (compact JSON), `--pretty`, `--field=<jq expressi
 | Variable | Purpose |
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | API token (recommended). Alias: `CF_API_TOKEN`, or `--api-token=` |
-| `CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY` | Legacy global API key authentication (`CF_API_EMAIL`/`CF_API_KEY`) |
+| `CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY` | Legacy global API key authentication (`CF_API_EMAIL`/`CF_API_KEY`, or `--api-email=` / `--api-key=`) |
 | `CLOUDFLARE_ACCOUNT_ID` | Account for account-level features; auto-detected when the token sees one account or from the zone (`--account-id=`) |
 | `CLOUDFLARE_ZONE_ID` | Zone ID; skips the name lookup (`--zone-id=`) |
 | `CLOUDFLARE_DOMAIN` | Default zone (`--domain=` / `--zone=`) |
 | `CLOUDFLARE_ORIGIN_CA_KEY` | Origin CA key for `ssl origin-cert-*` (an API token with *SSL and Certificates:Edit* also works) |
 | `CLOUDFLARE_RESTORE_LEVEL` | Security level restored by `attack-mode disable` (default `high`) |
-| `CLOUDFLARE_API_BASE` | API base URL (default `https://api.cloudflare.com/client/v4`; used by the tests) |
+| `CLOUDFLARE_API_BASE` | API base URL (default `https://api.cloudflare.com/client/v4`; must be `https://`, plain `http://` only for localhost; used by the tests) |
 
 ### Environment files
 
-Octoflare loads the first of `--env=<file>` / `OCTOFLARE_ENV_FILE`, `./.octoflare`,
-`./.env.octoflare`, `~/.config/octoflare/.env`:
+Octoflare loads the file named by `-e <file>` / `--env-file=<file>` / `OCTOFLARE_ENV_FILE`
+(`--env=<file>` still works unless the command itself defines `--env`, as `pages deployments`
+does). Interactively, when no file is given, it also looks for `./.octoflare`,
+`./.env.octoflare` and `~/.config/octoflare/.env`; **unattended runs (CI, GitHub Actions) only
+load a file that was requested explicitly**, so a checked-in file from an untrusted contributor
+can never change where requests go:
 
 ```txt
 CLOUDFLARE_API_TOKEN="your-cloudflare-api-token"
@@ -119,10 +125,11 @@ CLOUDFLARE_ACCOUNT_ID="..."
 CLOUDFLARE_DOMAIN="example.com"
 ```
 
-Precedence is **command line > environment > env file**. Values already present in the
-environment (for example repository secrets in CI) are never overridden by a file unless
-`OCTOFLARE_ENV_OVERRIDE=true` is set. This differs from v1, which sourced the file over the
-environment.
+Precedence is **command line > environment > env file**. Variables that were present in the
+environment when Octoflare started (for example repository secrets in CI) are never overridden
+by a file unless `OCTOFLARE_ENV_OVERRIDE=true` is set; `OCTOFLARE_*` switches can be set from
+the file. Quoted values may be followed by `# comments`, and CRLF files are accepted. This
+differs from v1, which sourced the file over the environment.
 
 ### Behaviour switches
 
@@ -134,9 +141,9 @@ environment.
 | `--pretty` | Indent JSON output |
 | `--dry-run` / `OCTOFLARE_DRY_RUN=true` | Print the requests instead of sending them |
 | `--quiet` / `-q`, `--debug` | Less / more logging (`--debug` without a command prints the configuration) |
-| `--limit=<n>` | Fetch a single page of at most n items from list commands |
+| `--limit=<n>` | Return at most n items from list commands (pages are at most 50 items, so several pages may be fetched) |
 | `--github-output=false` | Do not write GitHub step outputs |
-| `OCTOFLARE_TIMEOUT`, `OCTOFLARE_RETRIES`, `OCTOFLARE_RETRY_DELAY` | HTTP timeout (60s), retries (3), initial back-off (2s) |
+| `OCTOFLARE_TIMEOUT`, `OCTOFLARE_RETRIES`, `OCTOFLARE_RETRY_DELAY`, `OCTOFLARE_PER_PAGE` | HTTP timeout (60s), retries (3), initial back-off (2s), page size (50) |
 | `OCTOFLARE_REF`, `OCTOFLARE_LIB_DIR`, `OCTOFLARE_HOME` | Git ref for updates/module downloads, module directory, per-user data directory |
 | `NO_COLOR` / `--color=never` | Disable coloured logs |
 
@@ -197,9 +204,16 @@ expected. Many commands also take a positional value, e.g. `octoflare ssl mode s
 ### Zone selection
 
 * `--domain=example.com` (or `CLOUDFLARE_DOMAIN`): the zone is looked up by name; a hostname such
-  as `www.example.com` is accepted and walked up to the zone.
-* `--zone-id=<id>` (or `CLOUDFLARE_ZONE_ID`): no lookup at all.
+  as `www.example.com` is accepted and walked up to the zone. An explicit `--domain` always wins
+  over an ambient `CLOUDFLARE_ZONE_ID`.
+* `--zone-id=<id>` on the command line, or `CLOUDFLARE_ZONE_ID` when no `--domain` was given: no
+  lookup at all.
 * No `--domain` but a fully qualified `--name`/`--hostname`: the zone is derived from it.
+* Record names are matched to the zone case-insensitively and stored lowercase; TXT content is
+  sent in the quoted form Cloudflare stores, so `dns upsert` stays idempotent for TXT records.
+* Values that switch a feature on or off (`ssl always-https on`, `bot fight-mode on`,
+  `cache tiered on`, ...) must be `on|off`, `true|false` or `yes|no`; anything else exits 3
+  instead of silently turning the feature off.
 
 ## Command reference
 
@@ -256,9 +270,9 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 |---|---|
 | `dns list --domain=<zone> [--type=A] [--name=<name>] [--content=<v>] [--proxied=true\|false] [--search=<text>] [--tag=<tag>]` | List DNS records |
 | `dns get --name=<name> [--type=<type>] \| --id=<record-id>` | Show one DNS record |
-| `dns create --name=<name> --type=<type> --content=<value> [--ttl=auto] [--proxied] [--priority=<n>] [--comment=<text>] [--tags=a,b]` | Create a DNS record |
+| `dns create --name=<name> --type=<type> --content=<value> [--ttl=auto\|<seconds>] [--proxied] [--priority=<n>] [--comment=<text>] [--tags=a,b]` | Create a DNS record (TXT content is quoted for you) |
 | `dns update (--id=<record-id> \| --name=<name> [--type=<type>]) [--content=] [--ttl=] [--proxied=] [--priority=] [--comment=] [--tags=] [--new-name=]` | Update an existing record |
-| `dns upsert --name=<name> --type=<type> --content=<value> [--ttl=auto] [--proxied] [--replace]` | Create the record or update it in place (idempotent) |
+| `dns upsert --name=<name> --type=<type> --content=<value> [--ttl=auto\|<seconds>] [--proxied] [--replace]` | Create the record or update it in place (idempotent; matches TXT content in its quoted form and SRV/CAA records on their data) |
 | `dns set --name=<name> --type=<type> --content=<value> [--ttl=auto] [--proxied]` | Alias of upsert: set a record to the given value |
 | `dns delete (--id=<record-id> \| --name=<name> [--type=<type>] [--content=<v>]) [--all] [--yes]` | Delete record(s) |
 | `dns export --domain=<zone> [--file=<path>]` | Export the zone file (BIND format) |
@@ -288,7 +302,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 
 | Command | Description |
 |---|---|
-| `cache purge --domain=<zone> (--everything \| --urls=a,b \| --hosts=a,b \| --tags=a,b \| --prefixes=a,b)` | Purge cached content |
+| `cache purge --domain=<zone> (--everything \| --urls=a,b \| --urls=@file \| --hosts=a,b \| --tags=a,b \| --prefixes=a,b)` | Purge cached content (inline --urls are comma separated; @file or - reads one URL per line) |
 | `cache status --domain=<zone>` | Show cache related settings |
 | `cache level --domain=<zone> [--value=aggressive\|basic\|simplified]` | Get or set the cache level |
 | `cache browser-ttl --domain=<zone> [--value=<seconds>]` | Get or set the browser cache TTL |
@@ -338,7 +352,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 |---|---|
 | `bot status --domain=<zone>` | Show Bot Fight Mode / bot management configuration |
 | `bot fight-mode --domain=<zone> on\|off` | Turn Bot Fight Mode on or off |
-| `bot ai-bots --domain=<zone> block\|disabled\|only_on_ad_pages` | Block AI crawlers (AI bots protection) |
+| `bot ai-bots --domain=<zone> block\|disabled\|only_on_ad_pages (or on\|off)` | Block AI crawlers (AI bots protection); on = block, off = disabled |
 | `bot set --domain=<zone> --settings='{"fight_mode":true,...}'` | Update any bot management field |
 
 #### `rule`
@@ -363,7 +377,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 | Command | Description |
 |---|---|
 | `redirect list --domain=<zone>` | List single redirects |
-| `redirect create --domain=<zone> --from=<path\|url\|host> --to=<url> [--status=301] [--preserve-query] [--preserve-path] [--match=exact\|prefix\|wildcard] [--description=<text>]` | Create a single redirect |
+| `redirect create --domain=<zone> --from=<path\|url\|host> --to=<url> [--status=301] [--preserve-query] [--preserve-path] [--match=exact\|prefix\|wildcard\|regex] [--description=<text>]` | Create a single redirect (a '*' in the host or path of --from matches as a wildcard; a query string in --from is ignored) |
 | `redirect upsert --domain=<zone> --from=<path\|url\|host> --to=<url> [--status=301] [...]` | Create or update the redirect for --from (idempotent) |
 | `redirect update --domain=<zone> --id=<rule-id> [--to=] [--status=] [--enabled=] [--description=]` | Update a redirect |
 | `redirect delete --domain=<zone> (--id=<rule-id> \| --from=<path\|url\|host> \| --description=<text>)` | Delete a redirect |
@@ -437,7 +451,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 | `pagerule list --domain=<zone> [--status=active\|disabled]` | List Page Rules |
 | `pagerule get --domain=<zone> (--id=<rule-id> \| --url=<pattern>)` | Show one Page Rule |
 | `pagerule create --domain=<zone> --url=<pattern> (--forward-to=<url> [--status-code=301] \| --cache-level=<v> \| --always-use-https \| --ssl=<v> \| --edge-cache-ttl=<s> \| --browser-cache-ttl=<s> \| --actions=<json> ...) [--priority=<n>] [--status=active\|disabled]` | Create a Page Rule |
-| `pagerule upsert --domain=<zone> --url=<pattern> [actions...]` | Create or replace the Page Rule for the URL pattern |
+| `pagerule upsert --domain=<zone> --url=<pattern> [actions...] [--priority=<n>] [--status=active\|disabled]` | Create or replace the Page Rule for the URL pattern (keeps the existing priority/status unless given) |
 | `pagerule update --domain=<zone> --id=<rule-id> [--url=<pattern>] [actions...] [--priority=<n>] [--status=<v>]` | Update a Page Rule |
 | `pagerule delete --domain=<zone> (--id=<rule-id> \| --url=<pattern>)` | Delete a Page Rule |
 | `pagerule enable --domain=<zone> (--id=<rule-id> \| --url=<pattern>)` | Enable a Page Rule |
@@ -451,7 +465,7 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 | `ssl status --domain=<zone>` | Overview of the SSL/TLS configuration |
 | `ssl mode --domain=<zone> [off\|flexible\|full\|strict]` | Get or set the SSL/TLS encryption mode |
 | `ssl min-tls --domain=<zone> [1.0\|1.1\|1.2\|1.3]` | Get or set the minimum TLS version |
-| `ssl tls13 --domain=<zone> [on\|off]` | Get or set TLS 1.3 |
+| `ssl tls13 --domain=<zone> [on\|off\|zrt]` | Get or set TLS 1.3 |
 | `ssl always-https --domain=<zone> [on\|off]` | Get or set Always Use HTTPS |
 | `ssl auto-rewrites --domain=<zone> [on\|off]` | Get or set Automatic HTTPS Rewrites |
 | `ssl opportunistic-encryption --domain=<zone> [on\|off]` | Get or set Opportunistic Encryption |
@@ -659,7 +673,6 @@ Run `octoflare help <resource>` for the same information in the terminal, or
 |---|---|
 | `batch run (--file=<commands.txt> \| --stdin \| --commands=<multi-line>) [--continue-on-error]` | Run many commands (one per line, # comments allowed) |
 
-
 ## GitHub Action
 
 Octoflare ships an `action.yml`, so any workflow can run it with `uses:`. Modules are part of the
@@ -768,8 +781,12 @@ When running under `CI`/`GITHUB_ACTIONS`, with `OCTOFLARE_UNATTENDED=true` or `-
 
 * no questions are asked (deletes proceed as if `--yes` was given);
 * a missing `curl` or `jq` is installed with the system package manager (apt, dnf, yum, apk,
-  pacman, zypper, brew; `sudo -n` when not root) and, failing that, as a static binary in
-  `~/.local/share/octoflare/bin`;
+  pacman, zypper, brew; `sudo -n` when not root); when that is impossible, `jq` falls back to the
+  pinned jq 1.7.1 static release whose SHA-256 is verified before use, installed into
+  `$OCTOFLARE_HOME/bin` (only used when that directory is private to the current user; `curl`
+  has no download fallback). When `HOME`, `XDG_DATA_HOME` and `OCTOFLARE_HOME` are all unset
+  Octoflare exits 69 instead of using `/tmp`;
+* only an explicitly requested env file is loaded (see above);
 * missing modules are downloaded from `https://raw.githubusercontent.com/octoleo/octoflare/<OCTOFLARE_REF>/src/lib/`
   into the first writable of `<script dir>/lib`, `<prefix>/lib/octoflare`, `~/.local/share/octoflare/lib`;
 * `octoflare --update` refreshes the script and every module.

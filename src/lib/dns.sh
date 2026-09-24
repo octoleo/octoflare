@@ -11,9 +11,9 @@
 
 registerCommand dns list "--domain=<zone> [--type=A] [--name=<name>] [--content=<v>] [--proxied=true|false] [--search=<text>] [--tag=<tag>]" "List DNS records"
 registerCommand dns get "--name=<name> [--type=<type>] | --id=<record-id>" "Show one DNS record"
-registerCommand dns create "--name=<name> --type=<type> --content=<value> [--ttl=auto] [--proxied] [--priority=<n>] [--comment=<text>] [--tags=a,b]" "Create a DNS record"
+registerCommand dns create "--name=<name> --type=<type> --content=<value> [--ttl=auto|<seconds>] [--proxied] [--priority=<n>] [--comment=<text>] [--tags=a,b]" "Create a DNS record (TXT content is quoted for you)"
 registerCommand dns update "(--id=<record-id> | --name=<name> [--type=<type>]) [--content=] [--ttl=] [--proxied=] [--priority=] [--comment=] [--tags=] [--new-name=]" "Update an existing record"
-registerCommand dns upsert "--name=<name> --type=<type> --content=<value> [--ttl=auto] [--proxied] [--replace]" "Create the record or update it in place (idempotent)"
+registerCommand dns upsert "--name=<name> --type=<type> --content=<value> [--ttl=auto|<seconds>] [--proxied] [--replace]" "Create the record or update it in place (idempotent; matches TXT content in its quoted form and SRV/CAA records on their data)"
 registerCommand dns set "--name=<name> --type=<type> --content=<value> [--ttl=auto] [--proxied]" "Alias of upsert: set a record to the given value"
 registerCommand dns delete "(--id=<record-id> | --name=<name> [--type=<type>] [--content=<v>]) [--all] [--yes]" "Delete record(s)"
 registerCommand dns export "--domain=<zone> [--file=<path>]" "Export the zone file (BIND format)"
@@ -29,13 +29,41 @@ dnsType() {
   printf '%s' "$(opt type)" | tr '[:lower:]' '[:upper:]'
 }
 
-# dnsTtl - Normalised ttl (auto -> 1)
+# dnsNumber - Validate that a numeric option holds a non-negative integer (prints it)
+#
+# Arguments:
+#   $1: option name (for the error message)
+#   $2: value
+dnsNumber() {
+  [[ "$2" =~ ^[0-9]+$ ]] || die "Option --$1 must be a whole number (got \"$2\")" "$EX_ARGS"
+  printf '%s' "$2"
+}
+
+# dnsTtl - Normalised ttl (auto -> 1); dies unless the value is auto or a number
 dnsTtl() {
   local ttl="$1"
   case "$(lower "$ttl")" in
     ""|auto|automatic) echo 1 ;;
-    *) echo "$ttl" ;;
+    *) [[ "$ttl" =~ ^[0-9]+$ ]] || die "Option --ttl must be auto or a number of seconds (got \"$ttl\")" "$EX_ARGS"; echo "$ttl" ;;
   esac
+}
+
+# dnsTxtContent - TXT content in the RFC 1035 quoted form the API stores
+#
+# The API normalises TXT content to quoted "character strings" and returns it
+# with the surrounding double quotes, so unquoted input is wrapped here (inner
+# backslashes and double quotes are escaped) before it is sent or compared.
+#
+# Arguments:
+#   $1: record type
+#   $2: content
+dnsTxtContent() {
+  local type="$1" content="$2"
+  if [[ "$type" == "TXT" && -n "$content" && "${content:0:1}" != '"' ]]; then
+    content="$(printf '%s' "$content" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    content="\"${content}\""
+  fi
+  printf '%s' "$content"
 }
 
 # dnsRecordBody - Build the JSON body for a create/update from the options
@@ -43,10 +71,10 @@ dnsTtl() {
 # Arguments:
 #   $1: "create" (include defaults) or "update" (only provided fields)
 dnsRecordBody() {
-  local mode="$1" type name content ttl body data
+  local mode="$1" type name content ttl body data num weight port
   type="$(dnsType)"
   name="$(optFirst "" name hostname record)"
-  content="$(optFirst "" content value target ip)"
+  content="$(dnsTxtContent "$type" "$(optFirst "" content value target ip)")"
   body='{}'
   [[ -n "$type" ]] && body="$(jq -cn --argjson b "$body" --arg v "$type" '$b + {type:$v}')"
   if [[ -n "$(opt new-name)" ]]; then
@@ -56,13 +84,16 @@ dnsRecordBody() {
   fi
   [[ -n "$content" ]] && body="$(jq -cn --argjson b "$body" --arg v "$content" '$b + {content:$v}')"
   if hasOpt ttl || [[ "$mode" == "create" ]]; then
-    ttl="$(dnsTtl "$(opt ttl auto)")"
+    ttl="$(dnsTtl "$(opt ttl auto)")" || exit $?
     body="$(jq -cn --argjson b "$body" --argjson v "$ttl" '$b + {ttl:$v}')"
   fi
   if hasOpt proxied || [[ "$mode" == "create" ]]; then
     body="$(jq -cn --argjson b "$body" --argjson v "$(optBool proxied false)" '$b + {proxied:$v}')"
   fi
-  hasOpt priority && body="$(jq -cn --argjson b "$body" --argjson v "$(opt priority)" '$b + {priority:$v}')"
+  if hasOpt priority; then
+    num="$(dnsNumber priority "$(opt priority)")" || exit $?
+    body="$(jq -cn --argjson b "$body" --argjson v "$num" '$b + {priority:$v}')"
+  fi
   hasOpt comment && body="$(jq -cn --argjson b "$body" --arg v "$(opt comment)" '$b + {comment:$v}')"
   hasOpt tags && body="$(jq -cn --argjson b "$body" --argjson v "$(toJsonArray "$(opt tags)")" '$b + {tags:$v}')"
   # structured records
@@ -70,15 +101,20 @@ dnsRecordBody() {
     data="$(readFileOrValue "$(opt data)")"
     body="$(jq -cn --argjson b "$body" --argjson v "$data" '$b + {data:$v}')"
   elif [[ "$type" == "SRV" && -n "$(opt port)" ]]; then
-    data="$(jq -cn --argjson p "$(opt priority 0)" --argjson w "$(opt weight 0)" --argjson port "$(opt port)" --arg t "$(optFirst "" srv-target target content)" '{priority:$p, weight:$w, port:$port, target:$t}')"
+    num="$(dnsNumber priority "$(opt priority 0)")" || exit $?
+    weight="$(dnsNumber weight "$(opt weight 0)")" || exit $?
+    port="$(dnsNumber port "$(opt port)")" || exit $?
+    data="$(jq -cn --argjson p "$num" --argjson w "$weight" --argjson port "$port" --arg t "$(optFirst "" srv-target target content)" '{priority:$p, weight:$w, port:$port, target:$t}')"
     body="$(jq -cn --argjson b "$body" --argjson v "$data" '$b + {data:$v} | del(.content)')"
   elif [[ "$type" == "CAA" && -n "$(opt tag)" ]]; then
-    data="$(jq -cn --argjson f "$(opt flags 0)" --arg tag "$(opt tag)" --arg v "$(optFirst "" caa-value value content)" '{flags:$f, tag:$tag, value:$v}')"
+    num="$(dnsNumber flags "$(opt flags 0)")" || exit $?
+    data="$(jq -cn --argjson f "$num" --arg tag "$(opt tag)" --arg v "$(optFirst "" caa-value value content)" '{flags:$f, tag:$tag, value:$v}')"
     body="$(jq -cn --argjson b "$body" --argjson v "$data" '$b + {data:$v} | del(.content)')"
   fi
   if [[ "$type" == "CNAME" && "$(optBool flatten)" == "true" ]]; then
     body="$(jq -cn --argjson b "$body" '$b + {settings:{flatten_cname:true}}')"
   fi
+  [[ -z "$body" ]] && die "Could not build the DNS record body from the given options" "$EX_SOFTWARE"
   printf '%s' "$body"
 }
 
@@ -91,7 +127,7 @@ dnsRecordBody() {
 dnsFind() {
   local fqdn query
   fqdn="$(recordFqdn "$1")"
-  query="$(cfQuery "name=${fqdn}" "type=${2:-}" "content=${3:-}")"
+  query="$(cfQuery "name=${fqdn}" "type=${2:-}" "content=$(dnsTxtContent "${2:-}" "${3:-}")")"
   cfApiList "/zones/${CF_ZONE_ID}/dns_records" "$query"
 }
 
@@ -147,7 +183,7 @@ cmd_dns_create() {
   requireOpt type
   [[ -z "$(optFirst "" name hostname record)" ]] && die "Missing required option --name=<name>" "$EX_ARGS"
   local body
-  body="$(dnsRecordBody create)"
+  body="$(dnsRecordBody create)" || exit $?
   if [[ "$(printf '%s' "$body" | jq 'has("content") or has("data")')" != "true" ]]; then
     die "Missing required option --content=<value>" "$EX_ARGS"
   fi
@@ -160,7 +196,7 @@ cmd_dns_update() {
   resolveZone
   local id body
   id="$(dnsSelectRecord)" || exit $?
-  body="$(dnsRecordBody update)"
+  body="$(dnsRecordBody update)" || exit $?
   [[ "$body" == "{}" ]] && die "Nothing to update. Provide --content, --ttl, --proxied, --priority, --comment, --tags or --new-name." "$EX_ARGS"
   logInfo "Updating DNS record ${id} in ${CF_ZONE_NAME:-$CF_ZONE_ID}..."
   cfApi PATCH "/zones/${CF_ZONE_ID}/dns_records/${id}" "$body"
@@ -174,7 +210,7 @@ cmd_dns_upsert() {
   name="$(optFirst "" name hostname record)"
   [[ -z "$name" ]] && die "Missing required option --name=<name>" "$EX_ARGS"
   type="$(dnsType)"
-  body="$(dnsRecordBody create)"
+  body="$(dnsRecordBody create)" || exit $?
   if [[ "$(printf '%s' "$body" | jq 'has("content") or has("data")')" != "true" ]]; then
     die "Missing required option --content=<value>" "$EX_ARGS"
   fi
@@ -189,8 +225,10 @@ cmd_dns_upsert() {
     return 0
   fi
   if [[ "$count" != "1" ]]; then
-    # several records share name+type (common for MX/TXT): prefer the one with the same content
-    match_id="$(printf '%s' "$existing" | jq -r --arg c "$(printf '%s' "$body" | jq -r '.content // ""')" '[.[] | select(.content == $c)][0].id // empty')"
+    # several records share name+type (common for MX/TXT/CAA): prefer the one with the same
+    # content, or the same data for structured records (SRV/CAA/--data) that carry no content
+    match_id="$(printf '%s' "$existing" | jq -r --argjson b "$body" \
+      '[.[] | . as $r | select(if $b.content != null then .content == $b.content else (.data | type) == "object" and ($b.data | to_entries | all(.value == $r.data[.key])) end)][0].id // empty')"
     if [[ -z "$match_id" ]]; then
       if [[ "$(optBool replace)" == "true" ]]; then
         logInfo "Replacing ${count} existing ${type} records for ${fqdn}..."

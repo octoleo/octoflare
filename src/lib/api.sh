@@ -10,13 +10,14 @@
 OCTOFLARE_TIMEOUT="${OCTOFLARE_TIMEOUT:-60}"
 OCTOFLARE_RETRIES="${OCTOFLARE_RETRIES:-3}"
 OCTOFLARE_RETRY_DELAY="${OCTOFLARE_RETRY_DELAY:-2}"
-OCTOFLARE_PER_PAGE="${OCTOFLARE_PER_PAGE:-100}"
+OCTOFLARE_PER_PAGE="${OCTOFLARE_PER_PAGE:-50}" # 50 is within every page-numbered endpoint's per_page contract
 
 CF_RESPONSE=""       # Body of the last response
 CF_HTTP_CODE=""      # HTTP status code of the last response
 CF_REQUEST=""        # JSON describing the last request (method, url, body)
 CF_AUTH_MODE="token" # token | origin-ca
-CF_AUTH_ARGS=()
+CF_AUTH_ARGS=()      # curl options carrying the credentials (-K <config file>, never a header in argv)
+CF_REQUEST_SEQ=0     # Counter used to give every request body its own temp file
 CF_ZONE_ID=""
 CF_ZONE_NAME=""
 CF_ACCOUNT_ID=""
@@ -26,24 +27,62 @@ DRY_RUN_REQUESTS="[]"
 #####################################################################################################################VDM
 ######################################## Transport
 
-# cfAuthArgs - Fill CF_AUTH_ARGS with the curl header options for the active credentials
+# cfTmpDir - Make sure the private temp directory exists (normally created at startup)
+cfTmpDir() {
+  [[ -n "${OCTOFLARE_TMPDIR:-}" && -d "$OCTOFLARE_TMPDIR" ]] && return 0
+  octoflareTmpDir
+}
+
+# cfConfigLine - Print one curl config line: name = "value" (value escaped for curl's quoting rules)
+cfConfigLine() {
+  local value="$2"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s = "%s"\n' "$1" "$value"
+}
+
+# cfAuthArgs - Fill CF_AUTH_ARGS with the curl options for the active credentials
+#
+# The credential headers are written to a 0600 curl config file under OCTOFLARE_TMPDIR and
+# passed with -K, so tokens never appear in the curl command line (ps, /proc/PID/cmdline).
 cfAuthArgs() {
   CF_AUTH_ARGS=()
-  if [[ "$CF_AUTH_MODE" == "origin-ca" && -n "${CLOUDFLARE_ORIGIN_CA_KEY:-}" ]]; then
-    CF_AUTH_ARGS+=(-H "X-Auth-User-Service-Key: ${CLOUDFLARE_ORIGIN_CA_KEY}")
-  elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
-    CF_AUTH_ARGS+=(-H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
-  elif [[ -n "${CLOUDFLARE_API_KEY:-}" && -n "${CLOUDFLARE_EMAIL:-}" ]]; then
-    CF_AUTH_ARGS+=(-H "X-Auth-Email: ${CLOUDFLARE_EMAIL}" -H "X-Auth-Key: ${CLOUDFLARE_API_KEY}")
-  fi
+  local file
+  cfTmpDir
+  file="${OCTOFLARE_TMPDIR}/curl.auth.$$"
+  (
+    umask 077
+    {
+      if [[ "$CF_AUTH_MODE" == "origin-ca" && -n "${CLOUDFLARE_ORIGIN_CA_KEY:-}" ]]; then
+        cfConfigLine header "X-Auth-User-Service-Key: ${CLOUDFLARE_ORIGIN_CA_KEY}"
+      elif [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+        cfConfigLine header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+      elif [[ -n "${CLOUDFLARE_API_KEY:-}" && -n "${CLOUDFLARE_EMAIL:-}" ]]; then
+        cfConfigLine header "X-Auth-Email: ${CLOUDFLARE_EMAIL}"
+        cfConfigLine header "X-Auth-Key: ${CLOUDFLARE_API_KEY}"
+      fi
+    } >"$file"
+  ) || die "Could not write the curl configuration in ${OCTOFLARE_TMPDIR}" "$EX_SOFTWARE"
+  chmod 600 "$file"
+  CF_AUTH_ARGS=(-K "$file")
 }
 
 # cfUrl - Build the full URL for an API path
+#
+# Accepts a path (relative to CLOUDFLARE_API_BASE) or an absolute URL that starts with
+# CLOUDFLARE_API_BASE; any other URL dies with EX_ARGS so credentials are never sent elsewhere.
 cfUrl() {
+  local base="${CLOUDFLARE_API_BASE%/}"
   case "$1" in
-    http://*|https://*) printf '%s' "$1" ;;
-    /*) printf '%s%s' "$CLOUDFLARE_API_BASE" "$1" ;;
-    *) printf '%s/%s' "$CLOUDFLARE_API_BASE" "$1" ;;
+    http://*|https://*)
+      if [[ "$1" == "$base" || "$1" == "${base}/"* || "$1" == "${base}?"* ]]; then
+        printf '%s' "$1"
+      else
+        die "Refusing to send a Cloudflare API request to ${1}: only paths under ${base} are allowed." "$EX_ARGS"
+      fi
+      ;;
+    /*) printf '%s%s' "$base" "$1" ;;
+    *) printf '%s/%s' "$base" "$1" ;;
   esac
 }
 
@@ -71,14 +110,20 @@ cfRequest() {
   shift 2
   [[ $# -gt 0 ]] && shift
   [[ $# -gt 0 ]] && shift
-  local url attempt=0 delay rc out hdr_file retry_after
-  url="$(cfUrl "$path")"
+  local url attempt=0 delay rc out hdr_file body_file retry_after retry
+  url="$(cfUrl "$path")" || exit $?
   if [[ "${CF_NO_AUTH:-false}" == "true" ]]; then
     CF_AUTH_ARGS=()
   else
     requireAuth
     cfAuthArgs
   fi
+  # The body goes through a private temp file (never argv: bodies can exceed the per-argument
+  # exec limit and may hold secrets that would otherwise show up in the process list).
+  cfTmpDir
+  CF_REQUEST_SEQ=$((CF_REQUEST_SEQ + 1))
+  body_file="${OCTOFLARE_TMPDIR}/body.$$.${CF_REQUEST_SEQ}.${RANDOM}"
+  printf '%s' "$body" >"$body_file" || die "Could not write the request body in ${OCTOFLARE_TMPDIR}" "$EX_SOFTWARE"
   local -a curl_args
   curl_args=(-sS --max-time "$OCTOFLARE_TIMEOUT" -X "$method" "$url" -w $'\n%{http_code}' -H "User-Agent: ${PROGRAM_NAME}/${PROGRAM_VERSION}")
   curl_args+=(${CF_AUTH_ARGS[@]+"${CF_AUTH_ARGS[@]}"})
@@ -86,30 +131,39 @@ cfRequest() {
     none|multipart) ;;
     *)
       curl_args+=(-H "Content-Type: ${ctype}")
-      [[ -n "$body" ]] && curl_args+=(--data-binary "$body")
+      [[ -n "$body" ]] && curl_args+=(--data-binary "@${body_file}")
       ;;
   esac
   curl_args+=("$@")
 
-  CF_REQUEST="$(jq -cn --arg m "$method" --arg u "$url" --arg b "$body" --arg ct "$ctype" \
+  CF_REQUEST="$(jq -cn --arg m "$method" --arg u "$url" --rawfile b "$body_file" --arg ct "$ctype" \
     '{method:$m, url:$u, content_type:$ct, body:(if $b=="" then null else (try ($b|fromjson) catch $b) end)}')"
   logDebug "API ${method} ${url}"
   [[ -n "$body" && "$OCTOFLARE_DEBUG" == "true" ]] && logDebug "Body: ${body}"
 
   if [[ "$OCTOFLARE_DRY_RUN" == "true" ]]; then
     logInfo "[dry-run] ${method} ${url}${body:+ ${body}}"
-    DRY_RUN_REQUESTS="$(jq -cn --argjson all "$DRY_RUN_REQUESTS" --argjson r "$CF_REQUEST" '$all + [$r]')"
+    DRY_RUN_REQUESTS="$(printf '%s\n%s\n' "$DRY_RUN_REQUESTS" "$CF_REQUEST" | jq -cs '.[0] + [.[1]]')"
     CF_HTTP_CODE=200
     if [[ "$method" == "GET" ]]; then
       CF_RESPONSE='{"success":true,"errors":[],"messages":[],"result":null,"result_info":{"page":1,"total_pages":1,"count":0,"total_count":0},"dry_run":true}'
     else
-      CF_RESPONSE="$(jq -cn --argjson r "$CF_REQUEST" '{success:true, errors:[], messages:[], result:$r.body, dry_run:true, request:$r}')"
+      CF_RESPONSE="$(printf '%s' "$CF_REQUEST" | jq -c '{success:true, errors:[], messages:[], result:.body, dry_run:true, request:.}')"
     fi
+    rm -f "$body_file"
     return 0
   fi
 
+  # Retry policy: 5xx replies and network failures are retried only for methods that are safe
+  # to replay (GET/HEAD/PUT/DELETE/PATCH). A POST is not idempotent: the server may already have
+  # processed it (e.g. a timeout after the record was created), so replaying it would create
+  # duplicates. POST is retried only on 429, which guarantees the request was rejected unprocessed.
+  case "$method" in
+    POST) retry=429 ;;
+    *) retry=all ;;
+  esac
   delay="$OCTOFLARE_RETRY_DELAY"
-  hdr_file="$(mktemp 2>/dev/null || echo "/tmp/octoflare.hdr.$$")"
+  hdr_file="${OCTOFLARE_TMPDIR}/headers.$$.${CF_REQUEST_SEQ}"
   while :; do
     attempt=$((attempt + 1))
     out="$(curl "${curl_args[@]}" -D "$hdr_file" 2>&1)"
@@ -120,7 +174,7 @@ cfRequest() {
       [[ "$CF_RESPONSE" == "$out" ]] && CF_RESPONSE=""
       case "$CF_HTTP_CODE" in
         429|500|502|503|504)
-          if [[ $attempt -le $OCTOFLARE_RETRIES ]]; then
+          if [[ $attempt -le $OCTOFLARE_RETRIES && ( "$retry" == "all" || "$CF_HTTP_CODE" == "429" ) ]]; then
             retry_after="$(grep -i '^retry-after:' "$hdr_file" 2>/dev/null | tail -n1 | tr -d '\r' | awk '{print $2}')"
             [[ "$retry_after" =~ ^[0-9]+$ ]] && delay="$retry_after"
             logWarn "Cloudflare API returned HTTP ${CF_HTTP_CODE}; retrying in ${delay}s (attempt ${attempt}/${OCTOFLARE_RETRIES})..."
@@ -130,19 +184,19 @@ cfRequest() {
           fi
           ;;
       esac
-      rm -f "$hdr_file"
+      rm -f "$hdr_file" "$body_file"
       [[ "$CF_HTTP_CODE" =~ ^2 ]] && return 0
       return 1
     fi
     CF_HTTP_CODE="000"
     CF_RESPONSE="$(jq -cn --arg e "$out" --arg rc "$rc" '{success:false, errors:[{code:0, message:("curl failed (exit " + $rc + "): " + $e)}], messages:[], result:null}')"
-    if [[ $attempt -le $OCTOFLARE_RETRIES ]]; then
+    if [[ $attempt -le $OCTOFLARE_RETRIES && "$retry" == "all" ]]; then
       logWarn "Network error talking to Cloudflare (curl exit ${rc}); retrying in ${delay}s (attempt ${attempt}/${OCTOFLARE_RETRIES})..."
       sleep "$delay"
       delay=$((delay * 2))
       continue
     fi
-    rm -f "$hdr_file"
+    rm -f "$hdr_file" "$body_file"
     return 1
   done
 }
@@ -241,20 +295,34 @@ cfPath() {
 # Arguments:
 #   $1: path
 #   $2: query string (optional, already encoded)
+#   $3: maximum per_page the endpoint accepts (default OCTOFLARE_PER_PAGE, 50)
+#
+# With --limit=N the pages are requested with per_page=min(N, max) and the fetch stops as
+# soon as N items were collected (which may take more than one page).
 #
 # Globals set:
 #   CF_RESPONSE = {"success":true,"result":[...all items...]}
 cfApiList() {
-  local path="$1" query="${2:-}" page=1 total_pages per_page="$OCTOFLARE_PER_PAGE" all='[]' items count
-  [[ -n "$(opt limit)" ]] && per_page="$(opt limit)"
+  local path="$1" query="${2:-}" page=1 total_pages per_page="${3:-$OCTOFLARE_PER_PAGE}" all='[]' items count limit total
+  limit="$(opt limit)"
+  if [[ -n "$limit" ]]; then
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || die "--limit must be a positive number (got '${limit}')." "$EX_ARGS"
+    [[ "$limit" -lt "$per_page" ]] && per_page="$limit"
+  fi
   while :; do
     cfApi GET "$(cfPath "$path" "${query:+${query}&}page=${page}&per_page=${per_page}")"
     items="$(cfResult '.result // []')"
     [[ "$(printf '%s' "$items" | jq -r 'type')" != "array" ]] && items="[$items]"
-    all="$(jq -cn --argjson a "$all" --argjson b "$items" '$a + $b')"
+    all="$(printf '%s\n%s\n' "$all" "$items" | jq -cs '.[0] + .[1]')"
     total_pages="$(cfResultRaw '.result_info.total_pages // empty')"
     count="$(printf '%s' "$items" | jq 'length')"
-    [[ -n "$(opt limit)" ]] && break
+    if [[ -n "$limit" ]]; then
+      total="$(printf '%s' "$all" | jq 'length')"
+      if [[ "$total" -ge "$limit" ]]; then
+        all="$(printf '%s' "$all" | jq -c --argjson n "$limit" '.[:$n]')"
+        break
+      fi
+    fi
     if [[ -n "$total_pages" ]]; then
       [[ $page -ge $total_pages ]] && break
     else
@@ -263,7 +331,7 @@ cfApiList() {
     page=$((page + 1))
     [[ $page -gt 1000 ]] && break
   done
-  CF_RESPONSE="$(jq -cn --argjson r "$all" '{success:true, errors:[], messages:[], result:$r}')"
+  CF_RESPONSE="$(printf '%s' "$all" | jq -c '{success:true, errors:[], messages:[], result:.}')"
 }
 
 # cfApiCursor - Fetch every page of a cursor-based list endpoint
@@ -278,11 +346,11 @@ cfApiCursor() {
     [[ -n "$cursor" ]] && q="${q:+${q}&}cursor=$(urlEncode "$cursor")"
     cfApi GET "$(cfPath "$path" "$q")"
     items="$(cfResult '.result // []')"
-    all="$(jq -cn --argjson a "$all" --argjson b "$items" '$a + $b')"
+    all="$(printf '%s\n%s\n' "$all" "$items" | jq -cs '.[0] + .[1]')"
     cursor="$(cfResultRaw '.result_info.cursors.after // .result_info.cursor // empty')"
     [[ -z "$cursor" || -n "$(opt limit)" ]] && break
   done
-  CF_RESPONSE="$(jq -cn --argjson r "$all" '{success:true, errors:[], messages:[], result:$r}')"
+  CF_RESPONSE="$(printf '%s' "$all" | jq -c '{success:true, errors:[], messages:[], result:.}')"
 }
 
 #####################################################################################################################VDM
@@ -336,16 +404,26 @@ lookupZone() {
 
 # resolveZone - Resolve the zone from --zone-id, --domain/--zone, CLOUDFLARE_*, or an FQDN option
 #
+# Precedence: an explicit --zone-id skips the lookup; an explicit --domain/--zone is always
+# looked up by name (an ambient CLOUDFLARE_ZONE_ID is ignored so the command cannot silently run
+# against another zone); otherwise CLOUDFLARE_ZONE_ID, then CLOUDFLARE_DOMAIN / an FQDN option.
+#
 # Globals set:
 #   CF_ZONE_ID, CF_ZONE_NAME
 resolveZone() {
   [[ -n "$CF_ZONE_ID" ]] && return 0
   local zone_id domain
-  zone_id="$(optFirst "${CLOUDFLARE_ZONE_ID:-}" zone-id)"
   domain="$(zoneOption)"
+  if hasOpt zone-id; then
+    zone_id="$(opt zone-id)"
+  elif hasOpt domain || hasOpt zone; then
+    zone_id=""
+  else
+    zone_id="${CLOUDFLARE_ZONE_ID:-}"
+  fi
   if [[ -n "$zone_id" ]]; then
     CF_ZONE_ID="$zone_id"
-    CF_ZONE_NAME="$domain"
+    CF_ZONE_NAME="$(lower "${domain%.}")"
     if [[ -z "$CF_ZONE_NAME" ]]; then
       if cfApiTry GET "/zones/${zone_id}"; then
         CF_ZONE_NAME="$(cfResultRaw '.result.name // empty')"
@@ -406,11 +484,15 @@ resolveAccount() {
 
 # recordFqdn - Turn a relative record name into a fully qualified one for the current zone
 #
+# DNS names are case-insensitive (Cloudflare stores them lowercased), so the zone suffix is
+# matched case-insensitively and the result is returned in lowercase.
+#
 # Arguments:
 #   $1: name (www, @, www.example.com, *.example.com)
 recordFqdn() {
-  local name="$1" zone="$CF_ZONE_NAME"
-  name="${name%.}"
+  local name zone
+  name="$(lower "${1%.}")"
+  zone="$(lower "$CF_ZONE_NAME")"
   [[ -z "$name" || "$name" == "@" ]] && { printf '%s' "$zone"; return; }
   if [[ -z "$zone" || "$name" == "$zone" || "$name" == *".${zone}" ]]; then
     printf '%s' "$name"

@@ -11,7 +11,7 @@
 registerCommand ssl status "--domain=<zone>" "Overview of the SSL/TLS configuration"
 registerCommand ssl mode "--domain=<zone> [off|flexible|full|strict]" "Get or set the SSL/TLS encryption mode"
 registerCommand ssl min-tls "--domain=<zone> [1.0|1.1|1.2|1.3]" "Get or set the minimum TLS version"
-registerCommand ssl tls13 "--domain=<zone> [on|off]" "Get or set TLS 1.3"
+registerCommand ssl tls13 "--domain=<zone> [on|off|zrt]" "Get or set TLS 1.3"
 registerCommand ssl always-https "--domain=<zone> [on|off]" "Get or set Always Use HTTPS"
 registerCommand ssl auto-rewrites "--domain=<zone> [on|off]" "Get or set Automatic HTTPS Rewrites"
 registerCommand ssl opportunistic-encryption "--domain=<zone> [on|off]" "Get or set Opportunistic Encryption"
@@ -28,6 +28,10 @@ registerCommand dnssec enable "--domain=<zone>" "Enable DNSSEC (returns the DS r
 registerCommand dnssec disable "--domain=<zone>" "Disable DNSSEC"
 
 # sslSettingCmd - Get, or set when a value is given (positional or --value)
+#
+# The ssl mode and min_tls_version values are passed through unchanged (as strings);
+# on/off settings accept on/off, true/false or yes/no and reject anything else
+# (tls_1_3 additionally accepts zrt).
 sslSettingCmd() {
   local name="$1" value
   value="$(opt value)"
@@ -35,8 +39,12 @@ sslSettingCmd() {
   if [[ -n "$value" ]]; then
     case "$name" in
       ssl|min_tls_version) ;;
-      *) case "$(normalizeBool "$value")" in true) value=on ;; false) [[ "$value" != "zrt" ]] && value=off ;; esac ;;
+      tls_1_3)
+        if [[ "$(lower "$value")" == "zrt" ]]; then value=zrt; else value="$(parseBool "$value")" || exit $?; fi
+        ;;
+      *) value="$(parseBool "$value")" || exit $? ;;
     esac
+    case "$value" in true) value=on ;; false) value=off ;; esac
     settingSet "$name" "$value"
   else
     settingGet "$name"
@@ -64,7 +72,7 @@ cmd_ssl_opportunistic_encryption() { sslSettingCmd opportunistic_encryption; }
 
 cmd_ssl_hsts() {
   resolveZone
-  local body
+  local body=""
   if [[ "$(optBool disable)" == "true" ]]; then
     body='{"strict_transport_security":{"enabled":false}}'
   elif hasOpt max-age || hasOpt include-subdomains || hasOpt preload || hasOpt nosniff || [[ "$(optBool enable)" == "true" ]]; then
@@ -85,7 +93,8 @@ cmd_ssl_universal() {
   value="$(opt value)"
   [[ -z "$value" && -n "${ARGS[2]:-}" ]] && value="${ARGS[2]}"
   if [[ -n "$value" ]]; then
-    cfApi PATCH "/zones/${CF_ZONE_ID}/ssl/universal/settings" "$(jq -cn --argjson v "$(normalizeBool "$value")" '{enabled:$v}')"
+    value="$(parseBool "$value")" || exit $?
+    cfApi PATCH "/zones/${CF_ZONE_ID}/ssl/universal/settings" "$(jq -cn --argjson v "$value" '{enabled:$v}')"
   else
     cfApi GET "/zones/${CF_ZONE_ID}/ssl/universal/settings"
   fi

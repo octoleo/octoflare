@@ -23,7 +23,7 @@ registerCommand rule apply "--domain=<zone> --phase=<phase> --file=<rules.json>"
 registerCommand rule export "--domain=<zone> --phase=<phase>" "Export the rules of a phase as JSON (input for 'rule apply')"
 
 registerCommand redirect list "--domain=<zone>" "List single redirects"
-registerCommand redirect create "--domain=<zone> --from=<path|url|host> --to=<url> [--status=301] [--preserve-query] [--preserve-path] [--match=exact|prefix|wildcard] [--description=<text>]" "Create a single redirect"
+registerCommand redirect create "--domain=<zone> --from=<path|url|host> --to=<url> [--status=301] [--preserve-query] [--preserve-path] [--match=exact|prefix|wildcard|regex] [--description=<text>]" "Create a single redirect (a '*' in the host or path of --from matches as a wildcard; a query string in --from is ignored)"
 registerCommand redirect upsert "--domain=<zone> --from=<path|url|host> --to=<url> [--status=301] [...]" "Create or update the redirect for --from (idempotent)"
 registerCommand redirect update "--domain=<zone> --id=<rule-id> [--to=] [--status=] [--enabled=] [--description=]" "Update a redirect"
 registerCommand redirect delete "--domain=<zone> (--id=<rule-id> | --from=<path|url|host> | --description=<text>)" "Delete a redirect"
@@ -226,7 +226,7 @@ rulesetDelete() {
 
 # ruleSignature - The fields compared to decide whether an upsert changes anything
 ruleSignature() {
-  printf '%s' "$1" | jq -cS '{action, action_parameters:(.action_parameters // null), expression, description:(.description // null), enabled:(if .enabled == null then true else .enabled end), ratelimit:(.ratelimit // null)}'
+  printf '%s' "$1" | jq -cS '{action, action_parameters:(.action_parameters // null), expression, description:(.description // null), enabled:(if .enabled == null then true else .enabled end), ratelimit:(.ratelimit // null), logging:(.logging // null)}'
 }
 
 # rulesetUpsert - Create the rule or update the matching one (by --id, --description, else expression)
@@ -409,36 +409,70 @@ cmd_rule_export() {
 REDIRECT_PHASE="http_request_dynamic_redirect"
 
 # quoteExpr - Quote a string for a Cloudflare filter expression
+#
+# JSON string escaping matches the rules-language escapes (\\ and \"), and jq behaves the
+# same on every Bash version (a quoted ${v//\\/\\\\} replacement does not double
+# backslashes on Bash < 4.3).
 quoteExpr() {
-  local v="$1"
-  v="${v//\\/\\\\}"
-  v="${v//\"/\\\"}"
-  printf '"%s"' "$v"
+  jq -rn --arg v "$1" '$v | tojson'
+}
+
+# listItems - Print the items of a comma-separated list, one per line, trimmed, without word-splitting or globbing
+listItems() {
+  toJsonArray "$1" | jq -r '.[]'
+}
+
+FROM_HOST=""
+FROM_PATH=""
+
+# redirectParseFrom - Split a --from value (path, URL or host[/path]) into FROM_HOST and FROM_PATH
+#
+# The host is lowercased (http.host is always lowercase). A query string or fragment is
+# dropped: http.request.uri.path never contains them, so an expression built from
+# "/docs?x=1" could never match.
+redirectParseFrom() {
+  local from="$1" rest
+  FROM_HOST=""
+  FROM_PATH=""
+  if [[ "$from" =~ ^https?:// ]]; then
+    rest="${from#*://}"
+    FROM_HOST="${rest%%/*}"
+    [[ "$rest" == */* ]] && FROM_PATH="/${rest#*/}"
+  elif [[ "$from" == /* ]]; then
+    FROM_PATH="$from"
+  else
+    FROM_HOST="${from%%/*}"
+    [[ "$from" == */* ]] && FROM_PATH="/${from#*/}"
+  fi
+  FROM_HOST="$(lower "${FROM_HOST%%\?*}")"
+  FROM_HOST="${FROM_HOST%%#*}"
+  if [[ "$FROM_PATH" == *[\?#]* ]]; then
+    [[ "$FROM_PATH" == *\?* ]] && logWarn "Ignoring the query string of --from=${from}: redirects match the path only (use --expression to match on http.request.uri.query)"
+    FROM_PATH="${FROM_PATH%%\?*}"
+    FROM_PATH="${FROM_PATH%%#*}"
+  fi
 }
 
 # redirectExpression - Build the matching expression from --from (path, URL or host) and --match
 redirectExpression() {
-  local from host="" path="" match parts=() rest
+  local from host="" path="" match parts=()
   if hasOpt expression; then
     printf '%s' "$(opt expression)"
     return 0
   fi
   from="$(optFirst "" from source)"
-  host="$(opt host)"
+  host="$(lower "$(opt host)")"
   match="$(opt match exact)"
   [[ -z "$from" ]] && die "Missing --from=<path|url|hostname> (or --expression=<filter>)" "$EX_ARGS"
-  if [[ "$from" =~ ^https?:// ]]; then
-    rest="${from#*://}"
-    host="${rest%%/*}"
-    [[ "$rest" == */* ]] && path="/${rest#*/}"
-  elif [[ "$from" == /* ]]; then
-    path="$from"
-  else
-    host="${from%%/*}"
-    [[ "$from" == */* ]] && path="/${from#*/}"
-  fi
+  redirectParseFrom "$from"
+  [[ -n "$FROM_HOST" ]] && host="$FROM_HOST"
+  path="$FROM_PATH"
   [[ "$path" == *\** && "$match" == "exact" ]] && match=wildcard
-  [[ -n "$host" ]] && parts+=("http.host eq $(quoteExpr "$host")")
+  if [[ "$host" == *\** ]]; then
+    parts+=("http.host wildcard $(quoteExpr "$host")")
+  elif [[ -n "$host" ]]; then
+    parts+=("http.host eq $(quoteExpr "$host")")
+  fi
   if [[ -n "$path" ]]; then
     case "$match" in
       exact) parts+=("http.request.uri.path eq $(quoteExpr "$path")") ;;
@@ -474,8 +508,9 @@ redirectTarget() {
     jq -cn --arg e "concat($(quoteExpr "${to%/}"), http.request.uri.path)" '{expression:$e}'
   elif [[ "$to" == *"\${"* ]]; then
     from="$(optFirst "" from source)"
-    path="$from"
-    [[ "$from" =~ ^https?:// ]] && { path="${from#*://}"; path="/${path#*/}"; }
+    redirectParseFrom "$from" 2>/dev/null
+    path="$FROM_PATH"
+    [[ -z "$path" ]] && die "A wildcard target (--to=${to}) needs a path pattern in --from (e.g. --from='/blog/*' or --from='old.example.com/blog/*')" "$EX_ARGS"
     jq -cn --arg e "wildcard_replace(http.request.uri.path, $(quoteExpr "$path"), $(quoteExpr "$to"))" '{expression:$e}'
   else
     jq -cn --arg v "$to" '{value:$v}'
@@ -544,13 +579,13 @@ FIREWALL_PHASE="http_request_firewall_custom"
 #   $3: "string" (quote values) or "raw"
 exprSet() {
   local field="$1" list="$2" kind="$3" item out=""
-  for item in $(printf '%s' "$list" | tr ',' ' '); do
+  while IFS= read -r item; do
     if [[ "$kind" == "string" ]]; then
       out="${out} $(quoteExpr "$item")"
     else
       out="${out} ${item}"
     fi
-  done
+  done < <(listItems "$list")
   printf '%s in {%s}' "$field" "${out# }"
 }
 
@@ -567,7 +602,7 @@ firewallExpression() {
     list="$(optFirst "" path-prefixes path-prefix)"
     if [[ -n "$list" ]]; then
       expr=""
-      for i in $(printf '%s' "$list" | tr ',' ' '); do expr="${expr} or starts_with(http.request.uri.path, $(quoteExpr "$i"))"; done
+      while IFS= read -r i; do expr="${expr} or starts_with(http.request.uri.path, $(quoteExpr "$i"))"; done < <(listItems "$list")
       parts+=("(${expr# or })")
     fi
     list="$(optFirst "" hosts host)"; [[ -n "$list" ]] && parts+=("$(exprSet http.host "$list" string)")
@@ -575,7 +610,7 @@ firewallExpression() {
     list="$(optFirst "" user-agents user-agent)"
     if [[ -n "$list" ]]; then
       expr=""
-      for i in $(printf '%s' "$list" | tr ',' ' '); do expr="${expr} or http.user_agent contains $(quoteExpr "$i")"; done
+      while IFS= read -r i; do expr="${expr} or http.user_agent contains $(quoteExpr "$i")"; done < <(listItems "$list")
       parts+=("(${expr# or })")
     fi
     [[ "$(optBool bots)" == "true" ]] && parts+=("cf.client.bot")
@@ -721,9 +756,9 @@ transformHeadersRule() {
     headers="$(jq -cn --argjson h "$headers" --arg n "$name" --arg v "$value" '$h + {($n):{operation:"set", expression:$v}}')"
   fi
   if hasOpt remove; then
-    for name in $(opt remove | tr ',' ' '); do
+    while IFS= read -r name; do
       headers="$(jq -cn --argjson h "$headers" --arg n "$name" '$h + {($n):{operation:"remove"}}')"
-    done
+    done < <(listItems "$(opt remove)")
   fi
   [[ "$headers" == "{}" ]] && die "Provide --set=Name=Value, --set-expression=Name=<expr>, --headers=<json> or --remove=Name" "$EX_ARGS"
   jq -cn --arg e "$(opt expression)" --argjson h "$headers" --arg d "$(opt description "Header transform: $(opt expression)")" --argjson en "$(optBool enabled true)" '{expression:$e, action:"rewrite", action_parameters:{headers:$h}, description:$d, enabled:$en}'
