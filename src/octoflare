@@ -305,6 +305,11 @@ ensureModules() {
 #####################################################################################################################VDM
 ######################################## Bootstrap
 
+# Names of the variables that were really present in the environment when Octoflare started
+# (env files may set anything else, including OCTOFLARE_* switches that modules default later).
+OCTOFLARE_ORIG_ENV=" $(compgen -e | tr '\n' ' ') "
+export OCTOFLARE_ORIG_ENV
+
 detectUnattended "$@"
 
 # Dependencies: curl for the Cloudflare API, jq for JSON handling.

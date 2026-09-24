@@ -77,11 +77,13 @@ _log() {
     esac
   fi
   printf '%s[%s]%s %s\n' "$color" "$level" "$reset" "$msg" >&2
+  # GitHub workflow commands go to stderr too: the runner processes both streams and
+  # stdout must stay clean for --json / --field consumers and $(...) captures.
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
     case "$level" in
-      error) printf '::error title=%s::%s\n' "$PROGRAM_NAME" "$msg" ;;
-      warn) printf '::warning title=%s::%s\n' "$PROGRAM_NAME" "$msg" ;;
-      debug) printf '::debug::%s\n' "$msg" ;;
+      error) printf '::error title=%s::%s\n' "$PROGRAM_NAME" "$msg" >&2 ;;
+      warn) printf '::warning title=%s::%s\n' "$PROGRAM_NAME" "$msg" >&2 ;;
+      debug) printf '::debug::%s\n' "$msg" >&2 ;;
     esac
   fi
 }
@@ -122,6 +124,7 @@ optVarName() {
 setOpt() {
   local var
   var="$(optVarName "$1")"
+  [[ "$var" =~ ^OPT_[A-Za-z0-9_]+$ ]] || die "Invalid option name: --${1}" "$EX_ARGS"
   printf -v "$var" '%s' "$2"
   case " $OPT_NAMES " in
     *" $1 "*) ;;
@@ -164,6 +167,67 @@ normalizeBool() {
     1|true|yes|y|on|enable|enabled) echo true ;;
     *) echo false ;;
   esac
+}
+
+# parseBool - Strict boolean: prints true or false, exits with EX_ARGS for anything else
+#
+# Use for on/off style values that change state, so that a typo never silently
+# turns a feature off: v="$(parseBool "$value")" || exit $?
+parseBool() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|y|on|enable|enabled) echo true ;;
+    0|false|no|n|off|disable|disabled) echo false ;;
+    *) die "Invalid value \"${1:-}\" (expected on|off, true|false or yes|no)" "$EX_ARGS" ;;
+  esac
+}
+
+# splitArgs - Tokenise a command line the way a shell would, WITHOUT evaluating anything
+#
+# Handles whitespace separation, 'single quotes', "double quotes" (with \" \\ \$ \` escapes)
+# and backslash escapes outside quotes. $(...), backticks, variables and redirections stay
+# literal text. The tokens are returned in the SPLIT_ARGS array (may be empty).
+#
+# Returns:
+#   0 on success, 1 on an unterminated quote
+splitArgs() {
+  local line="$1" i ch nxt state=none token="" have=false len
+  SPLIT_ARGS=()
+  len=${#line}
+  for ((i = 0; i < len; i++)); do
+    ch="${line:i:1}"
+    case "$state" in
+      none)
+        case "$ch" in
+          ' '|$'\t'|$'\r'|$'\n')
+            if [[ "$have" == "true" ]]; then SPLIT_ARGS+=("$token"); token=""; have=false; fi
+            ;;
+          "'") state=single; have=true ;;
+          '"') state=double; have=true ;;
+          "\\") i=$((i + 1)); token+="${line:i:1}"; have=true ;;
+          *) token+="$ch"; have=true ;;
+        esac
+        ;;
+      single)
+        if [[ "$ch" == "'" ]]; then state=none; else token+="$ch"; fi
+        ;;
+      double)
+        case "$ch" in
+          '"') state=none ;;
+          "\\")
+            nxt="${line:i+1:1}"
+            case "$nxt" in
+              '"'|"\\"|'$'|'`') i=$((i + 1)); token+="$nxt" ;;
+              *) token+="$ch" ;;
+            esac
+            ;;
+          *) token+="$ch" ;;
+        esac
+        ;;
+    esac
+  done
+  [[ "$state" != "none" ]] && return 1
+  [[ "$have" == "true" ]] && SPLIT_ARGS+=("$token")
+  return 0
 }
 
 # optFirst - Return the first option that is set from a list, or the default
@@ -323,29 +387,68 @@ loadEnvLine() {
   key="${key%"${key##*[![:space:]]}"}"        # rtrim key
   [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && return 0
   value="${value#"${value%%[![:space:]]*}"}"
-  # strip surrounding quotes
-  if [[ "$value" == \"*\" && ${#value} -ge 2 ]]; then
-    value="${value:1:${#value}-2}"
+  value="${value%$'\r'}"
+  # quoted values: take the text up to the matching closing quote, ignore what follows (comments)
+  if [[ "$value" == \"* ]]; then
+    value="${value#\"}"
+    value="$(envUnquote "$value" '"')"
     value="${value//\\\"/\"}"
-  elif [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then
-    value="${value:1:${#value}-2}"
+  elif [[ "$value" == \'* ]]; then
+    value="${value#\'}"
+    value="$(envUnquote "$value" "'")"
   else
     # drop trailing inline comment for unquoted values
     value="${value%%[[:space:]]#*}"
     value="${value%"${value##*[![:space:]]}"}"
   fi
-  if [[ -z "${!key+x}" || "$OCTOFLARE_ENV_OVERRIDE" == "true" ]]; then
+  # only variables that were really present in the process environment win over the file
+  if [[ "$OCTOFLARE_ENV_OVERRIDE" == "true" ]] || ! envWasSet "$key"; then
     export "$key=$value"
   fi
 }
 
-# loadEnvFile - Load variables from --env, OCTOFLARE_ENV_FILE, ./.octoflare or ~/.config/octoflare/.env
+# envUnquote - Text of a quoted value up to its closing quote (backslash escapes kept)
+envUnquote() {
+  local rest="$1" q="$2" out="" ch i len
+  len=${#rest}
+  for ((i = 0; i < len; i++)); do
+    ch="${rest:i:1}"
+    if [[ "$ch" == "\\" && "$q" == '"' ]]; then
+      out+="$ch${rest:i+1:1}"
+      i=$((i + 1))
+      continue
+    fi
+    [[ "$ch" == "$q" ]] && break
+    out+="$ch"
+  done
+  printf '%s' "$out"
+}
+
+# envWasSet - True when the variable was present in the environment when Octoflare started
+envWasSet() {
+  if [[ -n "${OCTOFLARE_ORIG_ENV:-}" ]]; then
+    case "$OCTOFLARE_ORIG_ENV" in
+      *" $1 "*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  [[ -n "${!1+x}" ]]
+}
+
+# loadEnvFile - Load variables from --env / OCTOFLARE_ENV_FILE, or (interactively) ./.octoflare,
+# ./.env.octoflare and ~/.config/octoflare/.env
+#
+# In unattended runs (CI, GitHub Actions) only an explicitly requested file is loaded: a
+# checked-in ./.octoflare from an untrusted contributor must never be able to redirect
+# requests or change zones silently.
 loadEnvFile() {
   local explicit path
-  explicit="$(optOrEnv env OCTOFLARE_ENV_FILE "")"
+  explicit="$(optFirst "${OCTOFLARE_ENV_FILE:-}" env env-file)"
   if [[ -n "$explicit" ]]; then
     [[ -f "$explicit" ]] || die "Environment file not found: ${explicit}" "$EX_CONFIG"
     path="$explicit"
+  elif [[ "$OCTOFLARE_UNATTENDED" == "true" ]]; then
+    return 0
   else
     for path in "./.${PROGRAM_CODE}" "./.env.${PROGRAM_CODE}" "${HOME:-/nonexistent}/.config/${PROGRAM_CODE}/.env"; do
       [[ -f "$path" ]] && break
@@ -358,6 +461,8 @@ loadEnvFile() {
   done <"$path"
   ENV_FILE_LOADED="$path"
   logDebug "Loaded environment file: ${path}"
+  # the file may have changed OCTOFLARE_* switches: re-apply (command line options still win)
+  applyGlobalOpts
 }
 
 # applyCredentialOpts - Copy credential options/aliases into the canonical CLOUDFLARE_* variables
@@ -365,7 +470,7 @@ applyCredentialOpts() {
   hasOpt api-token && CLOUDFLARE_API_TOKEN="$(opt api-token)"
   hasOpt token && CLOUDFLARE_API_TOKEN="$(opt token)"
   hasOpt api-key && CLOUDFLARE_API_KEY="$(opt api-key)"
-  hasOpt email && CLOUDFLARE_EMAIL="$(opt email)"
+  hasOpt api-email && CLOUDFLARE_EMAIL="$(opt api-email)"
   hasOpt account-id && CLOUDFLARE_ACCOUNT_ID="$(opt account-id)"
   hasOpt zone-id && CLOUDFLARE_ZONE_ID="$(opt zone-id)"
   hasOpt origin-ca-key && CLOUDFLARE_ORIGIN_CA_KEY="$(opt origin-ca-key)"
@@ -382,7 +487,16 @@ applyCredentialOpts() {
   : "${CLOUDFLARE_ORIGIN_CA_KEY:=${CF_ORIGIN_CA_KEY:-}}"
   : "${CLOUDFLARE_API_BASE:=https://api.cloudflare.com/client/v4}"
   CLOUDFLARE_API_BASE="${CLOUDFLARE_API_BASE%/}"
-  export CLOUDFLARE_API_TOKEN CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID CLOUDFLARE_DOMAIN CLOUDFLARE_ORIGIN_CA_KEY CLOUDFLARE_API_BASE
+  case "$CLOUDFLARE_API_BASE" in
+    https://*|http://127.0.0.1:*|http://127.0.0.1/*|http://localhost:*|http://localhost/*) ;;
+    *) die "CLOUDFLARE_API_BASE must use https:// (got ${CLOUDFLARE_API_BASE})" "$EX_CONFIG" ;;
+  esac
+  # export only what is set, so env files loaded later (e.g. per batch line) can still fill the gaps
+  local var
+  for var in CLOUDFLARE_API_TOKEN CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_ZONE_ID CLOUDFLARE_DOMAIN CLOUDFLARE_ORIGIN_CA_KEY; do
+    if [[ -n "${!var}" ]]; then export "${var?}"; else unset "${var?}"; fi
+  done
+  export CLOUDFLARE_API_BASE
   ghMask "${CLOUDFLARE_API_TOKEN:-}"
   ghMask "${CLOUDFLARE_API_KEY:-}"
   ghMask "${CLOUDFLARE_ORIGIN_CA_KEY:-}"
@@ -391,6 +505,7 @@ applyCredentialOpts() {
 
 # requireAuth - Ensure we have credentials for the Cloudflare API
 requireAuth() {
+  [[ "${CF_AUTH_MODE:-token}" == "origin-ca" && -n "${CLOUDFLARE_ORIGIN_CA_KEY:-}" ]] && return 0
   if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]] && [[ -z "${CLOUDFLARE_API_KEY:-}" || -z "${CLOUDFLARE_EMAIL:-}" ]]; then
     die "CLOUDFLARE_API_TOKEN must be set (via --api-token, the environment, or an env file). Alternatively set CLOUDFLARE_EMAIL and CLOUDFLARE_API_KEY." "$EX_CONFIG"
   fi
@@ -433,7 +548,7 @@ ghMask() {
     *"|${1}|"*) return 0 ;;
   esac
   GH_MASKED="${GH_MASKED}|${1}|"
-  printf '::add-mask::%s\n' "$1"
+  printf '::add-mask::%s\n' "$1" >&2
 }
 
 # ghSummary - Append markdown to the GitHub step summary when available
@@ -549,7 +664,7 @@ toJsonArray() {
 # toJsonValue - Convert a CLI string to a typed JSON value (number, bool, null, object/array or string)
 toJsonValue() {
   local v="$1"
-  if printf '%s' "$v" | jq -e . >/dev/null 2>&1; then
+  if printf '%s' "$v" | jq . >/dev/null 2>&1; then
     case "$v" in
       \{*|\[*|true|false|null) printf '%s' "$v"; return 0 ;;
       *) if [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then printf '%s' "$v"; return 0; fi ;;
@@ -697,6 +812,7 @@ runCommand() {
   if [[ "$(optBool help)" == "true" || -z "$resource" ]]; then
     if [[ -n "$resource" && "$resource" != "help" ]]; then
       showResourceHelp "$resource"
+      return $?
     elif [[ "$(optBool debug)" == "true" && -z "$resource" ]]; then
       cmd_config_show
     else
@@ -744,14 +860,37 @@ defaultAction() {
   esac
 }
 
+OCTOFLARE_TMPDIR=""
+EXIT_CODE_WRITTEN=false
+
+# octoflareTmpDir - Create the private per-run temporary directory (OCTOFLARE_TMPDIR) once.
+# Call it directly (never inside $(...)) and use "$OCTOFLARE_TMPDIR" afterwards; it is removed
+# by the EXIT trap.
+octoflareTmpDir() {
+  [[ -n "$OCTOFLARE_TMPDIR" && -d "$OCTOFLARE_TMPDIR" ]] && return 0
+  OCTOFLARE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/octoflare.XXXXXX")" || die "Could not create a temporary directory" "$EX_SOFTWARE"
+  chmod 700 "$OCTOFLARE_TMPDIR"
+  export OCTOFLARE_TMPDIR
+}
+
+# octoflareExit - EXIT trap: publish the exit code to GitHub Actions and clean up
+octoflareExit() {
+  local code=$?
+  if [[ "$EXIT_CODE_WRITTEN" != "true" ]] && ghEnabled; then
+    ghOutput exit_code "$code"
+    EXIT_CODE_WRITTEN=true
+  fi
+  [[ -n "$OCTOFLARE_TMPDIR" && -d "$OCTOFLARE_TMPDIR" ]] && rm -rf "$OCTOFLARE_TMPDIR"
+  return 0
+}
+
 # octoflareMain - Entry point called by the bootstrap
 octoflareMain() {
   local code
+  trap octoflareExit EXIT
+  octoflareTmpDir
   runCommand "$@"
   code=$?
-  if ghEnabled; then
-    ghOutput exit_code "$code"
-  fi
   exit "$code"
 }
 

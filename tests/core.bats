@@ -78,14 +78,55 @@ setup() { setup_env; }
   assert_json 'has("api_base") and has("lib_dir")'
 }
 
-@test "env file is loaded from ./.octoflare and does not override the environment" {
-  printf 'CLOUDFLARE_DOMAIN="file.example.com"\nCLOUDFLARE_ACCOUNT_ID=acc-file # comment\nexport CLOUDFLARE_RESTORE_LEVEL=medium\n' > .octoflare
-  octo config show --json
-  assert_json '.domain == "file.example.com" and .account_id == "acc-file" and .restore_level == "medium" and .env_file == "./.octoflare"'
+@test "env file is loaded from ./.octoflare (interactive) and does not override the environment" {
+  export OCTOFLARE_UNATTENDED=false
+  printf 'CLOUDFLARE_DOMAIN="file.example.com" # comment after quotes\nCLOUDFLARE_ACCOUNT_ID=acc-file # comment\nexport CLOUDFLARE_RESTORE_LEVEL=medium\nOCTOFLARE_OUTPUT=json\n' > .octoflare
+  octo config show
+  assert_json '.domain == "file.example.com" and .account_id == "acc-file" and .restore_level == "medium" and .env_file == "./.octoflare" and .output == "json"'
   CLOUDFLARE_DOMAIN=shell.example.com octo config show --json
   assert_json '.domain == "shell.example.com"'
   OCTOFLARE_ENV_OVERRIDE=true CLOUDFLARE_DOMAIN=shell.example.com octo config show --json
   assert_json '.domain == "file.example.com"'
+  octo config show --output=text --field=.output
+  [ "$output" = "text" ]
+}
+
+@test "unattended runs ignore ./.octoflare unless the file is requested explicitly" {
+  printf 'CLOUDFLARE_DOMAIN=file.example.com\n' > .octoflare
+  octo config show --json
+  assert_json '.domain == "" and .env_file == ""'
+  octo config show --env=.octoflare --json
+  assert_json '.domain == "file.example.com"'
+  OCTOFLARE_ENV_FILE=.octoflare octo config show --field=.domain
+  [ "$output" = "file.example.com" ]
+}
+
+@test "env file values with quotes, escapes and CRLF are parsed" {
+  printf 'A="x \\"y\\" z" # c\r\nB='"'"'single # not comment'"'"'\r\nC=plain value # comment\r\n' > vars.env
+  run --separate-stderr bash -c "source "$OCTOFLARE_ROOT/src/lib/core.sh" 2>/dev/null; OCTOFLARE_ORIG_ENV=' PATH '; while IFS= read -r l || [ -n \"\$l\" ]; do loadEnvLine \"\$l\"; done < vars.env; printf '%s|%s|%s' \"\$A\" \"\$B\" \"\$C\""
+  [ "$output" = 'x "y" z|single # not comment|plain value' ]
+}
+
+@test "parseBool is strict and splitArgs never evaluates" {
+  run bash -c "source \"$OCTOFLARE_ROOT/src/lib/core.sh\" 2>/dev/null; parseBool ON; parseBool off; parseBool onn"
+  [ "$status" -eq 3 ]
+  [ "${lines[0]}" = "true" ]
+  [ "${lines[1]}" = "false" ]
+  cat > line.txt <<'EOT'
+a "b c" $(touch pwned) `id` d\ e 'it'"'"'s' --x="q\"in" ${HOME}
+EOT
+  run bash -c "source \"$OCTOFLARE_ROOT/src/lib/core.sh\" 2>/dev/null; IFS= read -r l < line.txt; splitArgs \"\$l\"; printf '%s\n' \"\${SPLIT_ARGS[@]}\""
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "a" ]
+  [ "${lines[1]}" = "b c" ]
+  [ "${lines[2]}" = '$(touch' ]
+  [ "${lines[3]}" = 'pwned)' ]
+  [ "${lines[4]}" = '`id`' ]
+  [ "${lines[5]}" = "d e" ]
+  [ "${lines[6]}" = "it's" ]
+  [ "${lines[7]}" = '--x=q"in' ]
+  [ "${lines[8]}" = '${HOME}' ]
+  [ ! -e pwned ]
 }
 
 @test "--env and -e load a specific file; missing file exits 2" {
@@ -178,9 +219,9 @@ setup() { setup_env; }
   : > "$GITHUB_OUTPUT"
   run --separate-stderr "$OCTOFLARE" batch run --domain=example.com --commands=$'zone id\ndns list --domain=nope.invalid' --json --quiet --continue-on-error
   [ "$status" -eq 1 ]
-  [ "$(printf '%s\n' "$output" | grep -c '^::add-mask::test-token$')" -eq 1 ]
-  printf '%s\n' "$output" | grep -q '^::error title=Octoflare::'
-  printf '%s\n' "$output" | grep -v '^::' | jq -e '.results[0].result.id == "zone123" and .results[1].success == false' >/dev/null
+  [ "$(printf '%s\n' "$stderr" | grep -c '^::add-mask::test-token$')" -eq 1 ]
+  printf '%s\n' "$stderr" | grep -q '^::error title=Octoflare::'
+  printf '%s\n' "$output" | jq -e '.results[0].result.id == "zone123" and .results[1].success == false' >/dev/null
   grep -q '^failed=1$' "$GITHUB_OUTPUT"
 }
 
@@ -191,12 +232,32 @@ setup() { setup_env; }
   [ ! -s "$GITHUB_OUTPUT" ]
 }
 
-@test "errors become GitHub annotations and secrets are masked in Actions" {
+@test "errors become GitHub annotations and secrets are masked in Actions (on stderr, stdout stays clean)" {
   export GITHUB_ACTIONS=true
   octo dns list --domain=nope.invalid
   [ "$status" -eq 4 ]
-  [[ "$output" == *"::error title=Octoflare::"* ]]
-  [[ "$output" == *"::add-mask::test-token"* ]]
+  [[ "$stderr" == *"::error title=Octoflare::"* ]]
+  [[ "$stderr" == *"::add-mask::test-token"* ]]
+  [ -z "$output" ]
+  octo zone id --domain=example.com --field=.id
+  [ "$output" = "zone123" ]
+}
+
+@test "exit code output is written even when a command dies" {
+  export GITHUB_OUTPUT="$BATS_TEST_TMPDIR/out.txt"
+  : > "$GITHUB_OUTPUT"
+  octo dns list --domain=nope.invalid
+  [ "$status" -eq 4 ]
+  grep -q '^exit_code=4$' "$GITHUB_OUTPUT"
+}
+
+@test "--api-email is the credential option; --email is free for commands" {
+  unset CLOUDFLARE_API_TOKEN
+  octo zone list --api-email=me@example.com --api-key=test-key --json --quiet
+  [ "$status" -eq 0 ]
+  mock_log | jq -e '.[0].headers.authorization == ""' >/dev/null
+  octo config show --email=someone@example.com --api-token=x --json
+  assert_json '.email == ""'
 }
 
 @test "batch runs commands from a file with shared options" {

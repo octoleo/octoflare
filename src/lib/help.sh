@@ -23,7 +23,9 @@ Global options
   --zone-id=<id>             Zone ID, skips the zone lookup (or CLOUDFLARE_ZONE_ID)
   --account-id=<id>          Account ID for account-level features (or CLOUDFLARE_ACCOUNT_ID)
   --api-token=<token>        API token (or CLOUDFLARE_API_TOKEN) - prefer the environment/secrets
-  -e, --env=<file>           Load a .env file (default: ./.octoflare, ~/.config/octoflare/.env)
+  --api-email=<email> --api-key=<key>   Legacy global API key authentication
+  -e, --env=<file>           Load a .env file (interactive default: ./.octoflare, ~/.config/octoflare/.env;
+                             unattended/CI runs only load a file given explicitly)
   --output=text|json         Output format (--json is a shortcut for --output=json)
   --field=<jq>               Print only this jq expression of the result (e.g. --field=.id)
   --pretty                   Pretty-print JSON output
